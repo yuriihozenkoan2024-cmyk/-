@@ -54,7 +54,8 @@ jobs:
           "$T" duck
           "$T" crush
           "$T" flange
-          "$T" clipkey
+          "$T" melodic
+          "$T" reverbsafe
 
       - name: Collect plugin files
         shell: bash

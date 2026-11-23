@@ -154,6 +154,70 @@ private:
     float level = 0.0f, bleed = 0.0f;
 };
 
+// CLIP tab: the clip's transfer curve - its shoulder, the ceiling the pen presses down, the live input riding it.
+// Drag up / down on it to change the shoulder (double-click: back to the preset's).
+class ClipCurve final : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+    explicit ClipCurve (juce::AudioProcessorValueTreeState& state) : apvts (state) {}
+    void setState (float knee, float ceilingPos, float pressure, float inputPeak);
+    void paint (juce::Graphics&) override;
+    void mouseDown (const juce::MouseEvent&) override;
+    void mouseDrag (const juce::MouseEvent&) override;
+    void mouseUp (const juce::MouseEvent&) override;
+    void mouseDoubleClick (const juce::MouseEvent&) override;
+
+private:
+    juce::Rectangle<float> plot() const;
+    juce::AudioProcessorValueTreeState& apvts;
+    float knee = 0.0f, pos = 1.0f, dyn = 1.0f, peak = 0.0f, dragFrom = 0.0f;
+    std::array<float, 10> trail {};
+    int trailHead = 0;
+    bool dragging = false;
+};
+
+// CLIP tab: the last periods of the voice going into the clip (outline) and coming out (ink); what is cut off is blood
+class ClipScope final : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+    void setData (const float* in, const float* out, int n, float samplesPerPeriod, float ceilingPos);
+    void paint (juce::Graphics&) override;
+
+private:
+    std::vector<float> a, b;
+    float ceilPos = 1.0f;
+};
+
+// CLIP tab: what the distortion adds at every overtone of your voice - ink = notes of the song's chord, blood = dirt.
+// The outline is what an ordinary distortion would add there. Drag a peak up / down to raise or lower that overtone,
+// double-click to reset it.
+class OvertoneMap final : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+    explicit OvertoneMap (juce::AudioProcessorValueTreeState& state) : apvts (state) {}
+    void setView (const mavka::Engine::OvertoneView& v, const juce::String& keyName, float polish);
+    void paint (juce::Graphics&) override;
+    void mouseMove (const juce::MouseEvent&) override;
+    void mouseExit (const juce::MouseEvent&) override;
+    void mouseDown (const juce::MouseEvent&) override;
+    void mouseDrag (const juce::MouseEvent&) override;
+    void mouseUp (const juce::MouseEvent&) override;
+    void mouseDoubleClick (const juce::MouseEvent&) override;
+    static constexpr int kBands = mavka::InnerControls::kBands, kHarm = mavka::InnerControls::kHarm;
+
+private:
+    juce::Rectangle<float> bars() const;
+    float xOf (float overtone) const;
+    int columnAt (float x) const;   // overtone index 0..10 (2nd .. 12th) or -1
+    float userDb (int h) const;
+    juce::AudioProcessorValueTreeState& apvts;
+    mavka::Engine::OvertoneView view;
+    float after[kBands] {}, before[kBands] {};   // shown levels (dB, with analyser ballistics)
+    juce::String key;
+    float polishAmt = 0.0f, dragDb = 0.0f, dragY = 0.0f;
+    int hover = -1, dragging = -1;
+};
+
 struct Page final : public juce::Component
 {
     juce::String description, notes;   // notes: a few printed lines (one per line) inside notesArea
@@ -206,7 +270,7 @@ public:
     void selectPage (int index);
     void updateTextures (bool synchronous);   // match the texture resolution to the screen (sync: for tests)
     float getTextureLevel() const noexcept { return texLevel; }
-    static constexpr int numPages = 5;
+    static constexpr int numPages = 6;
 
 private:
     void timerCallback() override;
@@ -227,13 +291,18 @@ private:
 
     juce::ComboBox presetBox;
     juce::Label osRunning;
-    juce::ToggleButton autoGain { "Auto gain" }, softLimit { "Soft limit" };
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> autoGainAttachment, softLimitAttachment;
+    juce::ToggleButton autoGain { "Auto gain" }, softLimit { "Soft limit" }, reverbSafe { "Reverb safe" };
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> autoGainAttachment, softLimitAttachment, reverbSafeAttachment;
 
     mavkaui::StrokeView stroke;
     mavkaui::ClockView clock;
     mavkaui::DuckMap duckMap;
     mavkaui::BleedDrop bleedDrop;
+    mavkaui::ClipCurve clipCurve { proc.apvts };
+    mavkaui::ClipScope clipScope;
+    mavkaui::OvertoneMap overtoneMap { proc.apvts };
+    int currentPage = 0;
+    std::vector<float> scopeIn, scopeOut;
     std::array<juce::TextButton, numPages> tabs;
     std::array<mavkaui::Page, numPages> pages;
 

@@ -132,6 +132,20 @@ int main (int argc, char** argv)
         p.uiScale = MavkaAudioProcessorEditor::minScale;
     }
 
+    // the melodic distortion's parameters: the overtone map is automatable, In Key is gone (folded into Sing / Dirt)
+    {
+        bool all = p.apvts.getParameter ("clipKey") == nullptr;
+        for (const char* id : { "clipShoulder", "clipSing", "clipDirt", "clipForce", "prism", "reverbSafe" })
+            all = all && p.apvts.getParameter (id) != nullptr;
+        for (int h = 2; h <= 12; ++h)
+            all = all && p.apvts.getParameter ("ot" + juce::String (h)) != nullptr;
+        check (all, "Shoulder, Sing, Dirt, Force, Prism, Reverb safe and the 11 overtone gains exist");
+        auto* sing = p.apvts.getParameter ("clipSing");
+        check (sing->getText (sing->getDefaultValue(), 32) == "120%", "Sing defaults to 120%");
+        auto* ot5 = p.apvts.getParameter ("ot5");
+        check (std::abs (ot5->convertFrom0to1 (ot5->getValueForText ("+6.0 dB")) - 6.0f) < 0.05f, "overtone gains parse dB");
+    }
+
     // text <-> value
     auto* ink = p.apvts.getParameter ("ink");
     check (ink->getText (ink->convertTo0to1 (-0.4f), 32) == "Press 40%", "Ink shows Press/Ink text");
@@ -173,6 +187,7 @@ int main (int argc, char** argv)
         }
         juce::AudioBuffer<float> buf (2, 1600);
         juce::MidiBuffer midi;
+        editor.selectPage (5);   // the CLIP tab meters the core while the audio runs
         const int ticks = 205;   // ~6.8 s: the rap section
         for (int t = 0; t < ticks; ++t)
         {
@@ -210,7 +225,9 @@ int main (int argc, char** argv)
         ed->setSize (juce::roundToInt (MavkaAudioProcessorEditor::baseW * 1.6f), juce::roundToInt (MavkaAudioProcessorEditor::baseH * 1.6f));
         editor.selectPage (4);
         snap ("large_4");
-        check (ok, "editor renders all five pages to images (small, base and large size)");
+        editor.selectPage (5);
+        snap ("large_5");
+        check (ok, "editor renders all six pages to images (small, base and large size)");
 
         // a 2x (4K / Retina) screen at the largest size: the textures follow the real pixel density
         {

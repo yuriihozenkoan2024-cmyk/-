@@ -59,7 +59,12 @@ enum ParamIndex
     // crusher
     P_CRUSH, P_CRUSHMODE,
     // flanger, pressure clip, output
-    P_FLANGE, P_FLANGEMODE, P_FLANGEFB, P_FLANGEDEPTH, P_CLIP, P_LIMIT, P_BLEED, P_CLIPKEY,
+    P_FLANGE, P_FLANGEMODE, P_FLANGEFB, P_FLANGEDEPTH, P_CLIP, P_LIMIT, P_BLEED,
+    // melodic distortion (the whole core): knee, melodic / non-melodic overtones, loudness coupling, stereo
+    P_SHOULDER, P_SING, P_DIRT, P_FORCE, P_PRISM,
+    // gain of every overtone the distortion adds (2nd .. 12th), dragged on the overtone map
+    P_OT2, P_OT3, P_OT4, P_OT5, P_OT6, P_OT7, P_OT8, P_OT9, P_OT10, P_OT11, P_OT12,
+    P_REVSAFE,
     P_COUNT
 };
 
@@ -138,7 +143,23 @@ inline const ParamDef* paramDefs() noexcept
         { "clip",        "Clip",          PType::Float,  0.0f, 1.0f,   0.0f,  0.0f, Unit::Percent, nullptr, 0 },
         { "limit",       "Soft Limit",    PType::Bool,   0.0f, 1.0f,   1.0f,  0.0f, Unit::None,    nullptr, 0 },
         { "bleed",       "Bleed",         PType::Float,  0.0f, 1.0f,   0.60f, 0.0f, Unit::Percent, nullptr, 0 },
-        { "clipKey",     "In Key",        PType::Float,  0.0f, 1.0f,   0.60f, 0.0f, Unit::Percent, nullptr, 0 },
+        { "clipShoulder","Shoulder",      PType::Float,  0.0f, 1.0f,   0.9775f, 0.0f, Unit::Percent, nullptr, 0 },
+        { "clipSing",    "Sing",          PType::Float,  0.0f, 2.0f,   1.20f, 0.0f, Unit::Percent, nullptr, 0 },
+        { "clipDirt",    "Dirt",          PType::Float,  0.0f, 1.5f,   0.15f, 0.0f, Unit::Percent, nullptr, 0 },
+        { "clipForce",   "Force",         PType::Float,  0.0f, 1.0f,   0.60f, 0.0f, Unit::Percent, nullptr, 0 },
+        { "prism",       "Prism",         PType::Float,  0.0f, 1.0f,   0.30f, 0.0f, Unit::Percent, nullptr, 0 },
+        { "ot2",         "Overtone 2",    PType::Float, -30.0f, 12.0f, 0.0f,  0.0f, Unit::Db,      nullptr, 0 },
+        { "ot3",         "Overtone 3",    PType::Float, -30.0f, 12.0f, 0.0f,  0.0f, Unit::Db,      nullptr, 0 },
+        { "ot4",         "Overtone 4",    PType::Float, -30.0f, 12.0f, 0.0f,  0.0f, Unit::Db,      nullptr, 0 },
+        { "ot5",         "Overtone 5",    PType::Float, -30.0f, 12.0f, 0.0f,  0.0f, Unit::Db,      nullptr, 0 },
+        { "ot6",         "Overtone 6",    PType::Float, -30.0f, 12.0f, 0.0f,  0.0f, Unit::Db,      nullptr, 0 },
+        { "ot7",         "Overtone 7",    PType::Float, -30.0f, 12.0f, 0.0f,  0.0f, Unit::Db,      nullptr, 0 },
+        { "ot8",         "Overtone 8",    PType::Float, -30.0f, 12.0f, 0.0f,  0.0f, Unit::Db,      nullptr, 0 },
+        { "ot9",         "Overtone 9",    PType::Float, -30.0f, 12.0f, 0.0f,  0.0f, Unit::Db,      nullptr, 0 },
+        { "ot10",        "Overtone 10",   PType::Float, -30.0f, 12.0f, 0.0f,  0.0f, Unit::Db,      nullptr, 0 },
+        { "ot11",        "Overtone 11",   PType::Float, -30.0f, 12.0f, 0.0f,  0.0f, Unit::Db,      nullptr, 0 },
+        { "ot12",        "Overtone 12",   PType::Float, -30.0f, 12.0f, 0.0f,  0.0f, Unit::Db,      nullptr, 0 },
+        { "reverbSafe",  "Reverb Safe",   PType::Bool,   0.0f, 1.0f,   0.0f,  0.0f, Unit::None,    nullptr, 0 },
     };
     return d;
 }
@@ -171,6 +192,7 @@ static const PresetValue kPresetMavka[] = { { "drive", 0.40f } };
 
 // the cleanest end: sheen + handwriting, almost no dirt
 static const PresetValue kPresetSilk[] = {
+    { "clipShoulder", 1.0f }, { "clipSing", 1.0f }, { "clipDirt", 0.0f }, { "prism", 0.25f },
     { "flange", 0.08f }, 
     { "twin", 0.22f }, { "twinType", 0.0f }, { "forest", 0.10f }, 
     { "slant", 0.25f }, { "ligature", 0.15f }, 
@@ -181,6 +203,7 @@ static const PresetValue kPresetSilk[] = {
 
 // dark & warm
 static const PresetValue kPresetOakLamp[] = {
+    { "clipShoulder", 0.99f }, { "clipSing", 1.1f }, { "clipDirt", 0.25f }, { "clipForce", 0.5f },
     { "flange", 0.10f }, { "clip", 0.20f }, 
     { "forest", 0.18f }, { "forestType", 0.0f }, { "forestTune", 0.30f }, 
     { "slant", 0.30f }, { "ligature", 0.25f }, 
@@ -190,6 +213,7 @@ static const PresetValue kPresetOakLamp[] = {
     { "register", 0.0f }, { "decay", 2.2f }, { "bright", 0.25f }, { "harpDrive", 0.45f }, { "breath", 0.55f } };
 
 static const PresetValue kPresetSmokedVelvet[] = {
+    { "clipShoulder", 0.9975f }, { "clipSing", 1.3f }, { "clipDirt", 0.10f }, { "prism", 0.40f },
     { "flange", 0.15f }, { "flangeMode", 1.0f }, { "flangeDepth", 0.35f }, 
     { "forest", 0.30f }, { "forestType", 2.0f }, { "forestTune", 0.50f }, { "echo", 0.12f }, { "echoTime", 5.0f }, 
     { "slant", 0.45f }, { "ligature", 0.40f }, 
@@ -200,6 +224,7 @@ static const PresetValue kPresetSmokedVelvet[] = {
 
 // glassy & singing
 static const PresetValue kPresetGlassHarp[] = {
+    { "clipSing", 1.6f }, { "clipDirt", 0.05f }, { "prism", 0.55f },
     { "flange", 0.30f }, { "flangeFb", 0.75f }, 
     { "forest", 0.28f }, { "forestTune", 0.75f }, { "twin", 0.20f }, 
     { "slant", 0.50f }, { "ligature", 0.35f }, 
@@ -208,6 +233,7 @@ static const PresetValue kPresetGlassHarp[] = {
     { "ghostUp", 0.35f }, { "ink", 0.55f }, { "ratio", 2.0f }, { "chord", 4.0f }, { "smooth", 0.5f } };
 
 static const PresetValue kPresetCrystalSpit[] = {
+    { "clipSing", 1.4f }, { "clipDirt", 0.35f }, { "clipForce", 0.8f }, { "prism", 0.35f },
     { "flange", 0.30f }, { "flangeMode", 2.0f }, { "clip", 0.30f }, 
     { "echo", 0.22f }, { "echoTime", 3.0f }, { "echoFb", 0.35f }, { "forest", 0.10f }, { "twin", 0.25f }, { "twinType", 0.0f }, 
     { "slant", -0.30f }, { "ligature", 0.20f }, 
@@ -217,6 +243,7 @@ static const PresetValue kPresetCrystalSpit[] = {
 
 // torn & dirty
 static const PresetValue kPresetLikho[] = {
+    { "clipShoulder", 0.51f }, { "clipSing", 1.0f }, { "clipDirt", 0.80f }, { "clipForce", 0.8f }, { "prism", 0.2f },
     { "flange", 0.20f }, { "flangeMode", 2.0f }, { "flangeFb", 0.70f }, { "clip", 0.40f }, 
     { "crush", 0.20f }, 
     { "echo", 0.25f }, { "echoTime", 2.0f }, { "echoFb", 0.50f }, { "forest", 0.10f }, { "forestType", 0.0f }, { "twin", 0.0f }, 
@@ -226,6 +253,7 @@ static const PresetValue kPresetLikho[] = {
     { "harpDrive", 0.70f }, { "chord", 1.0f }, { "bias", 0.5f } };
 
 static const PresetValue kPresetTornTape[] = {
+    { "clipShoulder", 0.1536f }, { "clipSing", 1.0f }, { "clipDirt", 1.10f }, { "clipForce", 0.4f }, { "prism", 0.2f },
     { "flange", 0.35f }, { "flangeMode", 1.0f }, { "flangeFb", 0.80f }, { "clip", 0.60f }, 
     { "crush", 0.35f }, { "crushMode", 2.0f }, 
     { "echo", 0.35f }, { "echoTime", 0.0f }, { "echoFb", 0.65f }, { "forest", 0.12f }, { "spin", 0.40f }, { "twin", 0.0f }, 
@@ -235,6 +263,7 @@ static const PresetValue kPresetTornTape[] = {
     { "focus", 0.30f }, { "melody", 0.20f }, { "harpDrive", 0.85f }, { "mix", 0.5f }, { "ghostDown", 0.35f } };
 
 static const PresetValue kPresetBurntPhone[] = {
+    { "clipShoulder", 0.6975f }, { "clipSing", 0.9f }, { "clipDirt", 0.90f }, { "clipForce", 0.3f }, { "prism", 0.0f },
     { "flange", 0.0f }, { "clip", 0.50f }, 
     { "crush", 0.45f }, { "crushMode", 1.0f }, 
     { "echo", 0.30f }, { "echoTime", 0.0f }, { "echoFb", 0.45f }, { "forest", 0.0f }, { "twin", 0.0f }, 
@@ -245,6 +274,7 @@ static const PresetValue kPresetBurntPhone[] = {
 
 // ethereal & wide
 static const PresetValue kPresetNebula[] = {
+    { "clipShoulder", 0.9975f }, { "clipSing", 1.4f }, { "clipDirt", 0.05f }, { "prism", 0.75f },
     { "flange", 0.25f }, { "flangeMode", 1.0f }, { "flangeDepth", 0.70f }, 
     { "forest", 0.50f }, { "forestType", 3.0f }, { "forestDecay", 6.0f }, { "forestTune", 0.70f }, { "forestBloom", 0.70f }, { "echo", 0.20f }, { "echoTime", 5.0f }, { "twin", 0.20f }, { "twinType", 2.0f }, { "spin", 0.50f }, 
     { "slant", 0.60f }, { "ligature", 0.65f }, 
@@ -254,6 +284,7 @@ static const PresetValue kPresetNebula[] = {
     { "rate", 1.0f }, { "ratio", 7.0f }, { "warp", 0.30f } };
 
 static const PresetValue kPresetTrembita[] = {
+    { "clipSing", 1.7f }, { "clipDirt", 0.10f }, { "prism", 0.45f },
     { "flange", 0.30f }, { "flangeFb", 0.80f }, 
     { "forest", 0.38f }, { "forestType", 2.0f }, { "forestTune", 0.85f }, { "forestDecay", 4.0f }, { "echo", 0.10f }, 
     { "slant", 0.50f }, { "ligature", 0.45f }, 
@@ -262,6 +293,7 @@ static const PresetValue kPresetTrembita[] = {
     { "ghostDown", 0.25f } };
 
 static const PresetValue kPresetGhostChoir[] = {
+    { "clipSing", 1.3f }, { "prism", 0.60f },
     { "flange", 0.20f }, { "flangeMode", 2.0f }, 
     { "twin", 0.55f }, { "twinType", 3.0f }, { "forest", 0.25f }, { "forestType", 2.0f }, { "forestTune", 0.50f }, 
     { "slant", 0.35f }, { "ligature", 0.30f }, 
@@ -269,31 +301,49 @@ static const PresetValue kPresetGhostChoir[] = {
     { "ensemble", 0.75f }, { "motion", 0.55f }, { "ink", 0.45f }, { "ratio", 1.0f }, { "pulse", 0.4f } };
 
 static const PresetValue kPresetForestChoir[] = {
+    { "clipSing", 1.3f }, { "prism", 0.50f },
     { "flange", 0.20f }, 
     { "twin", 0.50f }, { "twinType", 3.0f }, { "forest", 0.55f }, { "forestType", 3.0f }, { "forestTune", 0.90f },
     { "forestDecay", 7.0f }, { "forestBloom", 0.65f }, { "melody", 0.60f }, { "drive", 0.30f }, { "spin", 0.45f },
     { "chord", 8.0f }, { "slant", 0.45f }, { "ligature", 0.20f }, { "mix", 0.50f } };
 
 static const PresetValue kPresetEchoSpirit[] = {
+    { "clipShoulder", 0.91f }, { "clipSing", 1.1f }, { "clipDirt", 0.45f }, { "clipForce", 0.7f },
     { "flange", 0.20f }, { "flangeMode", 1.0f }, { "clip", 0.30f }, 
     { "crush", 0.15f }, 
     { "echo", 0.50f }, { "echoTime", 5.0f }, { "echoFb", 0.75f }, { "spin", 0.60f }, { "forest", 0.20f },
     { "drive", 0.50f }, { "grit", 0.30f }, { "ink", -0.30f }, { "slant", -0.35f }, { "ligature", 0.0f }, { "twin", 0.15f } };
 
 static const PresetValue kPresetPixelSpirit[] = {
+    { "clipShoulder", 0.99f }, { "clipSing", 1.3f }, { "clipDirt", 0.30f },
     { "flange", 0.25f }, { "clip", 0.20f }, 
     { "crush", 0.62f }, { "crushMode", 0.0f }, { "drive", 0.35f }, { "grit", 0.10f }, { "melody", 0.50f },
     { "forest", 0.30f }, { "forestTune", 0.70f }, { "twin", 0.20f }, { "ink", 0.55f }, { "slant", 0.40f },
     { "chord", 7.0f }, { "mix", 0.55f } };
 
 static const PresetValue kPresetPressure[] = {
-    { "bleed", 0.85f }, { "clipKey", 1.0f }, { "clip", 0.75f }, { "ink", -0.65f }, { "inkTime", 140.0f }, { "drive", 0.45f }, { "grit", 0.35f },
+    { "clipShoulder", 0.8775f }, { "clipSing", 2.0f }, { "clipDirt", 0.0f }, { "clipForce", 0.6f }, { "prism", 0.35f },
+    { "bleed", 0.85f }, { "clip", 0.75f }, { "ink", -0.65f }, { "inkTime", 140.0f }, { "drive", 0.45f }, { "grit", 0.35f },
     { "melody", 0.45f }, { "harpDrive", 0.55f }, { "echo", 0.25f }, { "echoTime", 3.0f }, { "flange", 0.15f },
     { "flangeMode", 2.0f }, { "slant", -0.30f }, { "mix", 0.55f } };
 
 static const PresetValue kPresetCombArp[] = {
+    { "clipSing", 1.2f },
     { "flange", 0.65f }, { "flangeMode", 0.0f }, { "flangeFb", 0.85f }, { "drive", 0.35f }, { "melody", 0.30f },
     { "forest", 0.22f }, { "forestTune", 0.80f }, { "motion", 0.50f }, { "chord", 7.0f }, { "mix", 0.50f } };
+
+// the distortion refracted: every chord tone it adds sits at its own place around the head and turns with the clock
+static const PresetValue kPresetPrism[] = {
+    { "clipSing", 1.8f }, { "clipDirt", 0.10f }, { "clipForce", 0.6f }, { "prism", 1.0f }, { "ot2", -6.0f }, { "ot3", 3.0f },
+    { "drive", 0.58f }, { "grit", 0.25f }, { "clipShoulder", 0.9375f }, { "melody", 0.30f }, { "motion", 0.55f },
+    { "glass", 0.75f }, { "fold", 0.20f }, { "width", 0.80f }, { "twin", 0.0f }, { "forest", 0.12f }, { "flange", 0.10f },
+    { "ink", 0.45f }, { "slant", 0.35f }, { "mix", 0.50f } };
+
+// loud AND clean: slammed into the clip, but only the chord tones come out (no dirt, whatever the force)
+static const PresetValue kPresetIronSilk[] = {
+    { "clipSing", 1.4f }, { "clipDirt", 0.0f }, { "clipForce", 0.0f }, { "prism", 0.30f },
+    { "drive", 0.85f }, { "grit", 0.40f }, { "clipShoulder", 0.84f }, { "clip", 0.55f }, { "bleed", 0.30f },
+    { "fold", 0.25f }, { "smooth", 0.55f }, { "ink", 0.30f }, { "melody", 0.25f }, { "mix", 0.45f }, { "forest", 0.08f } };
 
 inline const Preset* factoryPresets (int& count) noexcept
 {
@@ -316,6 +366,8 @@ inline const Preset* factoryPresets (int& count) noexcept
         { "Pixel Spirit",   MAVKA_PRESET (kPresetPixelSpirit) },
         { "Pressure",       MAVKA_PRESET (kPresetPressure) },
         { "Comb Arp",       MAVKA_PRESET (kPresetCombArp) },
+        { "Prism",          MAVKA_PRESET (kPresetPrism) },
+        { "Iron Silk",      MAVKA_PRESET (kPresetIronSilk) },
     };
     count = (int) (sizeof (list) / sizeof (list[0]));
     return list;

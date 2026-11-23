@@ -1577,6 +1577,419 @@ void BleedDrop::paint (juce::Graphics& g)
 }
 
 //==============================================================================
+namespace
+{
+    // the clip exactly as the engine draws it (u: the clip's input in units of the ceiling)
+    float clipCurveAt (float u, float knee, float pos) noexcept
+    {
+        if (u > 0.0f)
+        {
+            const float uu = u / pos;
+            return pos * ((1.0f - knee) * mavka::fastTanh (uu) + knee * mavka::kneeClip (uu));
+        }
+        return (1.0f - knee) * mavka::fastTanh (u) + knee * mavka::kneeClip (u);
+    }
+
+    const char* kNoteNames[12] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
+
+    juce::String noteName (float hz)
+    {
+        if (hz < 20.0f) return {};
+        const int midi = (int) std::lround (69.0 + 12.0 * std::log2 ((double) hz / 440.0));
+        return juce::String (kNoteNames[((midi % 12) + 12) % 12]) + juce::String (midi / 12 - 1);
+    }
+}
+
+void ClipCurve::setState (float k, float ceilingPos, float pressure, float inputPeak)
+{
+    knee = k;
+    pos = juce::jlimit (0.3f, 1.0f, ceilingPos);
+    dyn = juce::jlimit (0.05f, 20.0f, pressure);
+    peak = juce::jmax (0.0f, inputPeak);
+    trail[(size_t) trailHead] = peak;
+    trailHead = (trailHead + 1) % (int) trail.size();
+    repaint();
+}
+
+juce::Rectangle<float> ClipCurve::plot() const
+{
+    return getLocalBounds().toFloat().withTrimmedBottom (34.0f).reduced (1.0f);
+}
+
+void ClipCurve::paint (juce::Graphics& g)
+{
+    const auto r = plot();
+    recess (g, r);
+    const auto in = r.reduced (8.0f);
+    const float xr = 2.4f, yr = 1.18f;
+    auto px = [&] (float x) { return in.getCentreX() + x / xr * in.getWidth() * 0.5f; };
+    auto py = [&] (float y) { return in.getCentreY() - y / yr * in.getHeight() * 0.5f; };
+
+    // grid: zero lines, unity, the ceilings
+    g.setColour (theme::hair.withAlpha (0.9f));
+    g.drawLine (in.getX(), py (0.0f), in.getRight(), py (0.0f), 0.7f);
+    g.drawLine (px (0.0f), in.getY(), px (0.0f), in.getBottom(), 0.7f);
+    for (float v : { -1.0f, 1.0f })
+    {
+        const float dash[] = { 2.0f, 3.0f };
+        g.drawDashedLine (juce::Line<float> (px (v), in.getY(), px (v), in.getBottom()), dash, 2, 0.6f);
+    }
+    g.setColour (theme::blood.withAlpha (0.55f));
+    g.drawLine (in.getX(), py (pos), in.getRight(), py (pos), 0.8f);
+    g.drawLine (in.getX(), py (-1.0f), in.getRight(), py (-1.0f), 0.8f);
+
+    // the curve at rest (faint) and as the pen / the clock press it right now (ink)
+    auto curve = [&] (float d)
+    {
+        juce::Path p;
+        for (int i = 0; i <= 120; ++i)
+        {
+            const float x = -xr + 2.0f * xr * (float) i / 120.0f;
+            const float y = clipCurveAt (x * d, knee, pos);
+            if (i == 0) p.startNewSubPath (px (x), py (y)); else p.lineTo (px (x), py (y));
+        }
+        return p;
+    };
+    g.setColour (theme::inkFaint.withAlpha (0.7f));
+    g.strokePath (curve (1.0f), juce::PathStrokeType (1.0f));
+    g.setColour (theme::ink.withAlpha (0.9f));
+    g.strokePath (curve (dyn), juce::PathStrokeType (1.8f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+    // the voice right now, riding the curve (with a short trail): blood while it is being clipped
+    for (int i = 0; i < (int) trail.size(); ++i)
+    {
+        const int idx = (trailHead + i) % (int) trail.size();
+        const float x = juce::jmin (trail[(size_t) idx], xr * 0.98f);
+        if (x <= 0.002f) continue;
+        const float age = (float) i / (float) trail.size();
+        const bool cut = x * dyn > 0.85f;
+        g.setColour ((cut ? theme::blood : theme::ink).withAlpha (0.08f + 0.5f * age));
+        const float rad = 1.2f + 2.2f * age;
+        g.fillEllipse (px (x) - rad, py (clipCurveAt (x * dyn, knee, pos)) - rad, 2.0f * rad, 2.0f * rad);
+    }
+
+    g.setColour (theme::inkFaint);
+    g.setFont (sans (9.0f, true, 0.14f));
+    g.drawText ("IN", in.withTrimmedTop (in.getHeight() - 12.0f), juce::Justification::centredRight, false);
+    g.drawText ("OUT", in.withHeight (12.0f).withTrimmedLeft (2.0f), juce::Justification::centredLeft, false);
+
+    // caption: the shoulder and how far the ceiling is pressed
+    auto cap = getLocalBounds().toFloat().withTop (r.getBottom() + 3.0f);
+    g.setColour (theme::ink.withAlpha (0.86f));
+    g.setFont (sans (10.5f, true, 0.14f));
+    const juce::String shoulder = knee < 0.2f ? "SOFT SHOULDER" : (knee < 0.65f ? "FIRM SHOULDER" : "HARD SHOULDER");
+    g.drawText (shoulder, cap.removeFromTop (15.0f), juce::Justification::centred, false);
+    g.setColour (theme::inkSoft);
+    g.setFont (sans (10.5f));
+    const float db = 20.0f * std::log10 (dyn);
+    g.drawText (std::abs (db) < 0.3f ? juce::String ("ceiling at rest") : "ceiling pressed " + juce::String (-db, 1) + " dB",
+                cap.removeFromTop (14.0f), juce::Justification::centred, false);
+}
+
+void ClipCurve::mouseDown (const juce::MouseEvent&)
+{
+    if (auto* p = apvts.getParameter ("clipShoulder"))
+    {
+        p->beginChangeGesture();
+        dragFrom = p->getValue();
+        dragging = true;
+    }
+}
+
+void ClipCurve::mouseDrag (const juce::MouseEvent& e)
+{
+    if (! dragging) return;
+    if (auto* p = apvts.getParameter ("clipShoulder"))
+        p->setValueNotifyingHost (juce::jlimit (0.0f, 1.0f, dragFrom - (float) e.getDistanceFromDragStartY() / 160.0f));
+}
+
+void ClipCurve::mouseUp (const juce::MouseEvent&)
+{
+    if (! dragging) return;
+    if (auto* p = apvts.getParameter ("clipShoulder"))
+        p->endChangeGesture();
+    dragging = false;
+}
+
+void ClipCurve::mouseDoubleClick (const juce::MouseEvent&)
+{
+    if (auto* p = apvts.getParameter ("clipShoulder"))
+    {
+        p->beginChangeGesture();
+        p->setValueNotifyingHost (p->getDefaultValue());
+        p->endChangeGesture();
+    }
+}
+
+//==============================================================================
+void ClipScope::setData (const float* in, const float* out, int n, float samplesPerPeriod, float ceilingPos)
+{
+    ceilPos = juce::jlimit (0.3f, 1.0f, ceilingPos);
+    // three periods of the voice (5 .. 20 ms at 48 kHz), started on a rising zero crossing so the picture stands still
+    const int span = juce::jlimit (240, n - 2, (int) std::lround (3.0f * juce::jmax (samplesPerPeriod, 1.0f)));
+    int start = n - span;
+    const int back = juce::jlimit (1, n - span - 1, (int) std::lround (juce::jmax (samplesPerPeriod, 80.0f)) + 2);
+    for (int i = n - span; i > n - span - back && i > 1; --i)
+        if (in[i - 1] < 0.0f && in[i] >= 0.0f) { start = i; break; }
+    a.assign (in + start, in + juce::jmin (n, start + span));
+    b.assign (out + start, out + juce::jmin (n, start + span));
+    repaint();
+}
+
+void ClipScope::paint (juce::Graphics& g)
+{
+    const auto r = getLocalBounds().toFloat();
+    recess (g, r);
+    const auto in = r.reduced (6.0f, 5.0f);
+    const float yr = 1.35f;
+    auto py = [&] (float y) { return in.getCentreY() - juce::jlimit (-yr, yr, y) / yr * in.getHeight() * 0.5f; };
+    g.setColour (theme::hair.withAlpha (0.8f));
+    g.drawLine (in.getX(), in.getCentreY(), in.getRight(), in.getCentreY(), 0.6f);
+    g.setColour (theme::blood.withAlpha (0.45f));
+    g.drawLine (in.getX(), py (ceilPos), in.getRight(), py (ceilPos), 0.7f);
+    g.drawLine (in.getX(), py (-1.0f), in.getRight(), py (-1.0f), 0.7f);
+
+    const int n = (int) a.size();
+    if (n > 2)
+    {
+        auto px = [&] (int i) { return in.getX() + in.getWidth() * (float) i / (float) (n - 1); };
+        // what the clip cuts off (between the voice going in and the voice coming out): blood
+        juce::Path cut, pin, pout;
+        for (int i = 0; i < n; ++i)
+        {
+            if (i == 0) { pin.startNewSubPath (px (i), py (a[0])); pout.startNewSubPath (px (i), py (b[0])); }
+            else { pin.lineTo (px (i), py (a[(size_t) i])); pout.lineTo (px (i), py (b[(size_t) i])); }
+        }
+        cut = pin;
+        for (int i = n - 1; i >= 0; --i)
+            cut.lineTo (px (i), py (b[(size_t) i]));
+        cut.closeSubPath();
+        {
+            juce::Graphics::ScopedSaveState save (g);
+            g.reduceClipRegion (in.toNearestInt());
+            g.setColour (theme::blood.withAlpha (0.16f));
+            g.fillPath (cut);
+            g.setColour (theme::inkFaint.withAlpha (0.85f));
+            g.strokePath (pin, juce::PathStrokeType (0.9f));
+            g.setColour (theme::ink.withAlpha (0.9f));
+            g.strokePath (pout, juce::PathStrokeType (1.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        }
+    }
+    g.setColour (theme::inkFaint);
+    g.setFont (sans (9.0f, true, 0.14f));
+    g.drawText (u8 ("IN  \xc2\xb7  OUT"), r.reduced (7.0f, 3.0f), juce::Justification::topRight, false);
+}
+
+//==============================================================================
+void OvertoneMap::setView (const mavka::Engine::OvertoneView& v, const juce::String& keyName, float polish)
+{
+    view = v;
+    key = keyName;
+    polishAmt = polish;
+    // analyser ballistics: up at once, down over a few hundred ms
+    for (int h = 0; h < kBands; ++h)
+    {
+        const float b0 = juce::jlimit (-90.0f, 0.0f, v.level[h]);
+        const float a0 = juce::jlimit (-90.0f, 12.0f, b0 + 20.0f * std::log10 (juce::jmax (v.gain[h], 1.0e-4f)));
+        before[h] = b0 > before[h] ? b0 : before[h] + (b0 - before[h]) * 0.25f;
+        after[h] = a0 > after[h] ? a0 : after[h] + (a0 - after[h]) * 0.25f;
+    }
+    repaint();
+}
+
+juce::Rectangle<float> OvertoneMap::bars() const
+{
+    return getLocalBounds().toFloat().reduced (6.0f, 0.0f).withTrimmedTop (18.0f).withTrimmedBottom (26.0f);
+}
+
+float OvertoneMap::xOf (float overtone) const
+{
+    const auto b = bars();
+    const float step = b.getWidth() / 11.0f;
+    return b.getX() + step * (overtone - 1.5f) + step * 0.25f;
+}
+
+int OvertoneMap::columnAt (float x) const
+{
+    const auto b = bars();
+    const float step = b.getWidth() / 11.0f;
+    const int h = (int) std::lround ((x - b.getX() - 0.25f * step) / step + 1.5f) - 2;
+    return h >= 0 && h < kHarm ? h : -1;
+}
+
+float OvertoneMap::userDb (int h) const
+{
+    if (auto* p = apvts.getRawParameterValue ("ot" + juce::String (h + 2)))
+        return p->load();
+    return 0.0f;
+}
+
+void OvertoneMap::paint (juce::Graphics& g)
+{
+    const auto r = getLocalBounds().toFloat();
+    recess (g, r.withTrimmedTop (16.0f));
+    const auto b = bars();
+    const float step = b.getWidth() / 11.0f;
+    const float lo = -66.0f, hi = -4.0f;
+    auto yOf = [&] (float db) { return b.getBottom() - b.getHeight() * juce::jlimit (0.0f, 1.0f, (db - lo) / (hi - lo)); };
+    const bool pitched = view.conf > 0.3f;
+    const float conf = juce::jlimit (0.0f, 1.0f, view.conf);
+
+    // header: the sung note and the song's chord, the legend
+    g.setFont (sans (10.5f, true, 0.12f));
+    g.setColour (pitched ? theme::ink.withAlpha (0.86f) : theme::inkFaint);
+    const juce::String note = pitched ? noteName (view.f0) : juce::String ("no pitch");
+    g.drawText (note + u8 ("  \xc2\xb7  ") + key + (pitched ? juce::String() : juce::String ("  \xc2\xb7  plain clipping")),
+                r.withHeight (15.0f).withTrimmedLeft (2.0f), juce::Justification::centredLeft, false);
+    {
+        // legend, right to left: [ink] chord tones   [blood] dirt   (PLAIN / polish)
+        const auto lg = r.withHeight (15.0f).withTrimmedRight (2.0f);
+        const auto f = sans (9.5f, false, 0.06f);
+        g.setFont (f);
+        float x = lg.getRight();
+        auto item = [&] (const juce::String& text, juce::Colour sq)
+        {
+            const float w = juce::GlyphArrangement::getStringWidth (f, text) + 2.0f;
+            x -= w;
+            g.setColour (theme::inkSoft);
+            g.drawText (text, juce::Rectangle<float> (x, lg.getY(), w, lg.getHeight()), juce::Justification::centredLeft, false);
+            if (! sq.isTransparent())
+            {
+                x -= 9.0f;
+                g.setColour (sq);
+                g.fillRect (x, lg.getCentreY() - 3.0f, 6.0f, 6.0f);
+            }
+            x -= 12.0f;
+        };
+        item ("dirt", theme::blood.withAlpha (0.9f));
+        item ("chord tones", theme::ink.withAlpha (0.85f));
+        if (view.plain)
+            item ("PLAIN", juce::Colours::transparentBlack);
+        else if (polishAmt > 0.05f)
+            item ("polish " + juce::String (juce::roundToInt (100.0f * polishAmt)) + "%", juce::Colours::transparentBlack);
+    }
+
+    // faint dB rules
+    g.setColour (theme::hair.withAlpha (0.55f));
+    for (float db : { -60.0f, -40.0f, -20.0f })
+        g.drawLine (b.getX(), yOf (db), b.getRight(), yOf (db), 0.5f);
+
+    // the sub-octave ghost's half overtones (thin, between the columns)
+    if (view.halves)
+        for (int h = kHarm; h < kBands; ++h)
+        {
+            const float x = xOf (mavka::inkey::kMult[h]);
+            const bool fits = view.fit[h] >= 0.5f;
+            const float top = yOf (after[h]);
+            g.setColour ((fits ? theme::ink : theme::blood).withAlpha (0.25f + 0.45f * conf));
+            g.fillRect (juce::Rectangle<float> (x - 1.2f, top, 2.4f, b.getBottom() - top));
+        }
+
+    for (int h = 0; h < kHarm; ++h)
+    {
+        const float x = xOf ((float) (h + 2));
+        const bool fits = view.fit[h] >= 0.5f;
+        const float w = step * 0.52f;
+        const bool hot = h == hover || h == dragging;
+        // what ordinary distortion would add here (outline) and what MAVKA adds (solid)
+        const float top = yOf (after[h]), was = yOf (before[h]);
+        const auto col = fits ? theme::ink : theme::blood;
+        if (hot)
+        {
+            g.setColour (theme::ink.withAlpha (0.05f));
+            g.fillRect (juce::Rectangle<float> (x - step * 0.5f, b.getY(), step, b.getHeight()));
+        }
+        g.setColour (col.withAlpha (pitched ? 0.30f + 0.62f * conf : 0.22f));
+        g.fillRect (juce::Rectangle<float> (x - w * 0.5f, top, w, b.getBottom() - top));
+        g.setColour (theme::inkSoft.withAlpha (0.55f));
+        g.drawLine (x - w * 0.5f - 2.0f, was, x + w * 0.5f + 2.0f, was, 1.0f);
+
+        // the overtone map setting
+        const float u = userDb (h);
+        if (std::abs (u) > 0.05f || hot)
+        {
+            g.setColour (hot ? theme::ink : theme::inkSoft);
+            g.setFont (numbers (9.5f));
+            g.drawText ((u > 0.0f ? "+" : "") + juce::String (u, std::abs (u) < 9.95f ? 1 : 0),
+                        juce::Rectangle<float> (x - step * 0.5f, juce::jmin (top, was) - 13.0f, step, 12.0f),
+                        juce::Justification::centred, false);
+        }
+
+        // overtone number and the note it is on
+        g.setColour (fits ? theme::ink.withAlpha (0.8f) : theme::blood.withAlpha (0.85f));
+        g.setFont (numbers (10.0f));
+        g.drawText (juce::String (h + 2), juce::Rectangle<float> (x - step * 0.5f, b.getBottom() + 2.0f, step, 11.0f),
+                    juce::Justification::centred, false);
+        g.setColour (pitched ? theme::inkSoft : theme::inkFaint.withAlpha (0.6f));
+        g.setFont (sans (9.0f));
+        g.drawText (pitched ? noteName (view.f0 * (float) (h + 2)) : juce::String (u8 ("\xc2\xb7")),
+                    juce::Rectangle<float> (x - step * 0.5f, b.getBottom() + 13.0f, step, 11.0f), juce::Justification::centred, false);
+    }
+}
+
+void OvertoneMap::mouseMove (const juce::MouseEvent& e)
+{
+    const int h = columnAt (e.position.x);
+    if (h != hover)
+    {
+        hover = h;
+        repaint();
+    }
+}
+
+void OvertoneMap::mouseExit (const juce::MouseEvent&)
+{
+    hover = -1;
+    repaint();
+}
+
+void OvertoneMap::mouseDown (const juce::MouseEvent& e)
+{
+    dragging = columnAt (e.position.x);
+    if (dragging < 0) return;
+    if (auto* p = apvts.getParameter ("ot" + juce::String (dragging + 2)))
+    {
+        p->beginChangeGesture();
+        dragDb = userDb (dragging);
+        dragY = e.position.y;
+    }
+}
+
+void OvertoneMap::mouseDrag (const juce::MouseEvent& e)
+{
+    if (dragging < 0) return;
+    if (auto* p = apvts.getParameter ("ot" + juce::String (dragging + 2)))
+    {
+        const float fine = e.mods.isShiftDown() ? 0.25f : 1.0f;
+        const float db = juce::jlimit (-30.0f, 12.0f, dragDb - (e.position.y - dragY) * 0.25f * fine);
+        p->setValueNotifyingHost (p->convertTo0to1 (db));
+        repaint();
+    }
+}
+
+void OvertoneMap::mouseUp (const juce::MouseEvent&)
+{
+    if (dragging < 0) return;
+    if (auto* p = apvts.getParameter ("ot" + juce::String (dragging + 2)))
+        p->endChangeGesture();
+    dragging = -1;
+    repaint();
+}
+
+void OvertoneMap::mouseDoubleClick (const juce::MouseEvent& e)
+{
+    const int h = columnAt (e.position.x);
+    if (h < 0) return;
+    if (auto* p = apvts.getParameter ("ot" + juce::String (h + 2)))
+    {
+        p->beginChangeGesture();
+        p->setValueNotifyingHost (p->convertTo0to1 (0.0f));
+        p->endChangeGesture();
+    }
+    repaint();
+}
+
+//==============================================================================
 void Page::paint (juce::Graphics& g)
 {
     if (dividerX > 0)
@@ -1727,14 +2140,16 @@ MavkaAudioProcessorEditor::MavkaAudioProcessorEditor (MavkaAudioProcessor& p)
         { "crush",  "Crush",  "Harmonic crusher: the sample-and-hold clock follows the pitch of your voice, "
                               "so the crushed voice still sings in tune. Mode in the HARDWARE tab." },
         { "clip",   "Clip",   "PRESSURE clip: its ceiling is pressed down by your pen (Ink), breathes with the chord clock "
-                              "and turns asymmetric on vowels. It plays IN KEY: it only adds overtones that are notes of "
-                              "the song's chord. What it cuts off BLEEDS into the harp, echo and forest. "
-                              "The drop fills while it bites." },
+                              "and turns asymmetric on vowels. What it cuts off BLEEDS into the harp, echo and forest. "
+                              "The drop fills while it bites. Its shoulder, the melodic split of ALL of MAVKA's distortion "
+                              "and the overtone map are on the CLIP tab." },
         { "flange", "Flange", "Nonlinear flanger tuned to the harp's chord (Tuned), a jet riding the clock (Jet) "
-                              "or following your Ink (Stroke). Mode in the FLANGE \xc2\xb7 CLIP tab." },
+                              "or following your Ink (Stroke). Mode in the FLANGE tab." },
         { "melody", "Melody", "How loud the harp in the lamp rings." },
         { "motion", "Motion", "Depth of the whole chord clock." },
-        { "mix",    "Mix",    "Dry / wet. Use 100% on a parallel bus." },
+        { "mix",    "Mix",    "Dry / wet. Use 100% on a parallel bus. Turned down (and with Drive turned down) MAVKA "
+                              "changes its character: less dirt, the lowest chord tones bloom, the wet layer gets denser - "
+                              "polish instead of distortion." },
         { "output", "Output", "Output level." },
     };
     for (int i = 0; i < 9; ++i)
@@ -1755,14 +2170,14 @@ MavkaAudioProcessorEditor::MavkaAudioProcessorEditor (MavkaAudioProcessor& p)
     surface.addAndMakeVisible (clock);
 
     // ---- tabs
-    const char* tabNames[numPages] = { "HARDWARE", "CLOCK", "HARP", "VOICE", "FLANGE \xc2\xb7 CLIP" };
+    const char* tabNames[numPages] = { "HARDWARE", "CLOCK", "HARP", "VOICE", "FLANGE", "CLIP" };
     for (int i = 0; i < numPages; ++i)
     {
         auto& t = tabs[(size_t) i];
         t.setButtonText (u8 (tabNames[i]));
         t.setClickingTogglesState (true);
         t.setRadioGroupId (4242);
-        t.setBounds (284 + i * 151, 332, 147, 28);
+        t.setBounds (284 + i * 126, 332, 122, 28);
         t.onClick = [this, i] { showPage (i); };
         surface.addAndMakeVisible (t);
 
@@ -1776,7 +2191,7 @@ MavkaAudioProcessorEditor::MavkaAudioProcessorEditor (MavkaAudioProcessor& p)
                            "The movement repeats like a groove instead of drifting.";
     pages[2].description = "Strings tuned to your song, struck by the distorted voice: a melodic halo even on rap. Set the key of your track.";
     pages[3].description = "How MAVKA listens: the same saturation for whispers and shouts, vowels sing, consonants stay clear.";
-    pages[4].description = "A flanger that plays the harp's chord and a clipper that bleeds and plays in key. Both follow "
+    pages[4].description = "A flanger that plays the harp's chord. Its feedback loop saturates with Grit and it follows "
                            "the same pen (Ink), the same clock and the same key as the rest of MAVKA.";
 
     {
@@ -1846,30 +2261,70 @@ MavkaAudioProcessorEditor::MavkaAudioProcessorEditor (MavkaAudioProcessor& p)
         addChoice (pg, "flangeMode", "Flange mode", { 6, 80, 112, 44 },
                    "Tuned: a comb tuned to the harp's chord that steps through it on the beat - an arpeggio inside your voice. "
                    "Jet: a classic jet sweep riding the chord clock. Stroke: the comb follows your pen, word by word.");
-        addKnob (pg, "flangeFb", "Feedback", false, { 120, 56, 88, 132 },
+        addKnob (pg, "flangeFb", "Feedback", false, { 130, 56, 96, 132 },
                  "Resonance of the comb. It saturates with Grit, so it sings instead of whistling.");
-        addKnob (pg, "flangeDepth", "Depth", false, { 208, 56, 88, 132 },
+        addKnob (pg, "flangeDepth", "Depth", false, { 230, 56, 96, 132 },
                  "Sweep range (Jet / Stroke) or tuning glide (Tuned). The sweep also follows how loud you sing.");
-        addKnob (pg, "clipKey", "In key", false, { 318, 56, 88, 132 },
-                 "IN KEY: the clipper hears the pitch of your voice and the song's chord (Key + Chord on the HARP tab). "
-                 "It may only add overtones that are notes of that chord: the ones that would clash (the major third every "
-                 "distortion adds to a minor song, the flat 7th, the 9th) are taken out of the clipping, and above 50% the "
-                 "chord tones are exaggerated - the clip sings the chord. Where there is no clear pitch (rap, breaths) "
-                 "it is an ordinary clipper.");
-        addKnob (pg, "bleed", "Bleed", false, { 406, 56, 88, 132 },
-                 "Pressure clip: what the clipper cuts off strikes the harp, throws more echo and blooms in the forest. "
-                 "0% = a plain (but still pressed and breathing) clipper.");
-        pg.notes = u8 ("PRESSURE CLIP\n"
-                       "ink \xe2\x86\x92 presses the ceiling down\n"
-                       "clock \xe2\x86\x92 the ceiling breathes in time\n"
-                       "vowels \xe2\x86\x92 asymmetric, warmer\n"
-                       "in key \xe2\x86\x92 only overtones of the chord\n"
-                       "the cut \xe2\x86\x92 harp \xc2\xb7 echo \xc2\xb7 forest");
-        pg.notesArea = { 520, 48, 236, 140 };
-        pg.dividerX = 308;
+        pg.notes = u8 ("FLANGE\n"
+                       "tuned \xe2\x86\x92 the comb plays the harp's chord, a note per beat\n"
+                       "jet \xe2\x86\x92 sweeps with the chord clock\n"
+                       "stroke \xe2\x86\x92 one sweep per syllable (your pen)\n"
+                       "feedback \xe2\x86\x92 saturates with Grit, sings, never whistles");
+        pg.notesArea = { 380, 48, 370, 140 };
+        pg.dividerX = 350;
+    }
+    {
+        // CLIP: the clip's curve, what goes in and out of it, and the melodic split of everything MAVKA adds
+        auto& pg = pages[5];
+        clipCurve.setBounds (4, 4, 158, 196);
+        clipCurve.setTooltip ("The clip's curve. Faint: at rest; ink: pressed by your pen and the clock right now; the dot is "
+                              "your voice riding it (blood while it is being clipped), the red lines are the ceilings "
+                              "(lower on vowels). Drag up / down to change the shoulder, double-click to reset.");
+        pg.addAndMakeVisible (clipCurve);
+        clipScope.setBounds (170, 4, 386, 66);
+        clipScope.setTooltip ("Three periods of your voice going into the clip (thin) and what comes out (ink). "
+                              "Blood: what the clip cuts off - it strikes the harp and throws echoes (Bleed).");
+        pg.addAndMakeVisible (clipScope);
+        overtoneMap.setBounds (170, 74, 386, 128);
+        overtoneMap.setTooltip ("What MAVKA's distortion adds at every overtone of your voice (the whole core: crusher, lamp, "
+                                "glass, fold, clip and the ghost octaves). Ink: a note of the song's chord (Key + Chord on the "
+                                "HARP tab) - Sing. Blood: dirt - Dirt. The line is what an ordinary distortion would add. "
+                                "Drag a peak up / down to raise or lower that overtone (Shift: fine), double-click to reset. "
+                                "Thin bars: what the sub-octave ghost adds between the overtones.");
+        pg.addAndMakeVisible (overtoneMap);
+        struct K { const char* id; const char* t; const char* tip; };
+        const K ks[] =
+        {
+            { "clipShoulder", "Shoulder", "The clip's knee: 100% = round and soft (tube-like), 0% = a hard wall (with a tiny "
+                                          "rounded corner). Independent of Grit now: Grit sets how hard the clip is hit." },
+            { "clipSing",     "Sing",     "What the distortion adds on the notes of the song's chord: 100% = as an ordinary "
+                                          "distortion would, 200% = twice. The octaves always count as chord tones." },
+            { "clipDirt",     "Dirt",     "What the distortion adds OFF the chord (the major third every distortion adds to a "
+                                          "minor song, the flat 7th, the 9th, the 11th...). 0% = only chord tones, 100% = as "
+                                          "ordinary, 150% = dirtier. Where there is no pitch (breaths, consonants) the "
+                                          "distortion stays ordinary." },
+            { "clipForce",    "Force",    "How much the dirt follows how hard you sing: 100% = only the loud, pushed words get "
+                                          "dirty, soft ones stay sweet; 0% = the same dirt everywhere - drive it as hard as "
+                                          "you like and set Dirt to 0 for loud AND clean." },
+            { "prism",        "Prism",    "The chord tones the distortion adds refract around your head: every overtone gets "
+                                          "its own place in the stereo field, swaying with the chord clock (Motion). The mono "
+                                          "sum stays exactly the same." },
+            { "bleed",        "Bleed",    "What the clipper cuts off strikes the harp, throws more echo and blooms in the "
+                                          "forest. 0% = a plain (but still pressed and breathing) clipper." },
+        };
+        for (int i = 0; i < 6; ++i)
+            addKnob (pg, ks[i].id, ks[i].t, false, { 563 + (i % 3) * 64, (i / 3) * 102, 64, 100 }, ks[i].tip);
     }
 
     // ---- AURA: nonlinear send effects
+    reverbSafe.setTooltip ("Reverb safe: for when MAVKA's sound goes ON INTO a reverb (MAVKA last on the vocal insert with "
+                           "the reverb on a send from that track, or MAVKA's return sent to the reverb too). The dirt is kept "
+                           "to the attacks of the words, nothing below 110 Hz, the top above 9 kHz 6 dB softer and the low "
+                           "side narrower - Lexicon, Valhalla or Seventh Heaven tails stay clean. If your reverb is fed from "
+                           "the dry voice on its own send, leave it off: the reverb never hears MAVKA.");
+    reverbSafe.setBounds (92, 592, 130, 20);
+    surface.addAndMakeVisible (reverbSafe);
+    reverbSafeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (proc.apvts, "reverbSafe", reverbSafe);
     addFader ("echo", "Echo", { 26, 620, 64, 164 },
               "Tape echo in time with the song. Every repeat is re-saturated and narrowed, so the echoes get grainier as they fade. Ducks while you sing.");
     addChoice (surface, "echoTime", "Time", { 98, 622, 104, 44 }, "Echo time (Slap or note values at the project tempo).");
@@ -1951,6 +2406,7 @@ MavkaAudioProcessorEditor::MavkaAudioProcessorEditor (MavkaAudioProcessor& p)
 MavkaAudioProcessorEditor::~MavkaAudioProcessorEditor()
 {
     stopTimer();
+    proc.engine.setMetering (false);
     texCancel = true;
     if (texJob.joinable())
         texJob.join();
@@ -2060,6 +2516,8 @@ void MavkaAudioProcessorEditor::showPage (int index)
 {
     for (int i = 0; i < numPages; ++i)
         pages[(size_t) i].setVisible (i == index);
+    currentPage = index;
+    proc.engine.setMetering (index == 5);   // the overtone map and the scope cost a little: only while they are seen
 }
 
 void MavkaAudioProcessorEditor::paint (juce::Graphics& g)
@@ -2104,6 +2562,27 @@ void MavkaAudioProcessorEditor::timerCallback()
     const float bleedAmount = proc.apvts.getRawParameterValue ("bleed")->load()
                               * juce::jmin (1.0f, 4.0f * proc.apvts.getRawParameterValue ("clip")->load());
     bleedDrop.setLevel (dropLevel, bleedAmount);
+
+    if (currentPage == 5)
+    {
+        mavka::Engine::ClipView cv;
+        e.getClipView (cv);
+        clipCurve.setState (cv.knee, cv.pos, cv.drive, cv.peakIn);
+        mavka::Engine::OvertoneView ov;
+        e.getOvertones (ov);
+        scopeIn.resize ((size_t) mavka::Engine::kScope);
+        scopeOut.resize ((size_t) mavka::Engine::kScope);
+        e.copyScope (scopeIn.data(), scopeOut.data());
+        const double sr = proc.getSampleRate() > 0.0 ? proc.getSampleRate() : 48000.0;
+        clipScope.setData (scopeIn.data(), scopeOut.data(), mavka::Engine::kScope,
+                           ov.conf > 0.3f ? (float) (sr / juce::jmax (40.0f, ov.f0)) : 260.0f, cv.pos);
+        const int key = juce::jlimit (0, 11, (int) proc.apvts.getRawParameterValue ("key")->load());
+        const int chord = juce::jlimit (0, 11, (int) proc.apvts.getRawParameterValue ("chord")->load());
+        const float mix = proc.apvts.getRawParameterValue ("mix")->load(), drive = proc.apvts.getRawParameterValue ("drive")->load();
+        const float polish = juce::jmax (mavka::smoothstep (0.5f, 0.1f, mix), mavka::smoothstep (0.35f, 0.05f, drive));
+        overtoneMap.setView (ov, juce::String (mavka::kKeyChoices[key]) + " " + juce::String (mavka::kChordChoices[chord]).toLowerCase(),
+                             polish);
+    }
 
     updateTextures (false);
 

@@ -2,9 +2,10 @@
 //   mavka_test list
 //   mavka_test render <in.wav> <out.wav> <preset> [--bpm 95] [--sr] [--set id=value ...]
 //   mavka_test renderall <in.wav> <outdir> [--bpm 95]
-//   mavka_test latency | alias | stress | cpu | switch | duck | crush | flange | clipkey
+//   mavka_test latency | alias | stress | cpu | switch | duck | crush | flange | melodic | reverbsafe
 #include "MavkaEngine.h"
 
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <complex>
@@ -118,9 +119,17 @@ static void linearParams (float* v)
     defaultValues (v);
     const char* zeros[] = { "drive", "grit", "melody", "motion", "ink", "slant", "ligature", "glass", "fold", "doppler",
                             "bias", "ghostDown", "ghostUp", "consist", "focus", "smooth", "preTilt", "tone", "warp",
-                            "echo", "forest", "twin", "crush", "flange", "clip", "clipKey" };
+                            "echo", "forest", "twin", "crush", "flange", "clip", "clipForce", "prism" };
     for (auto z : zeros) v[findParam (z)] = 0.0f;
     v[P_LAMP] = 1.0f; v[P_MIX] = 1.0f; v[P_LOWCUT] = 20.0f; v[P_HIGHCUT] = 20000.0f;
+    v[P_SING] = 1.0f; v[P_DIRT] = 1.0f;   // the plain distortion (the overtone filters are idle)
+}
+
+// the melodic distortion switched to "plain": exactly what an ordinary distortion would add
+static void plainDistortion (float* v)
+{
+    v[P_SING] = 1.0f; v[P_DIRT] = 1.0f; v[P_FORCE] = 0.0f; v[P_PRISM] = 0.0f; v[P_REVSAFE] = 0.0f;
+    for (int h = 0; h < 11; ++h) v[P_OT2 + h] = 0.0f;
 }
 
 
@@ -326,7 +335,7 @@ static int testSwitch()
     for (size_t i = 0; i < n; ++i) io[0][i] = 0.2f * (float) std::sin (2 * kPiD * 440 * (double) i / sr);
     runEngine (e, io, sr, 95.0, 256, [&] (size_t pos)
     {
-        if (pos >= (size_t) sr && v[P_OS] != 4.0f) { v[P_OS] = 4.0f; e.setParams (v); }   // -> 8x at t = 1 s
+        if (pos >= (size_t) sr && std::fabs (v[P_OS] - 4.0f) > 0.5f) { v[P_OS] = 4.0f; e.setParams (v); }   // -> 8x at t = 1 s
     });
     auto maxD2 = [&] (size_t a, size_t b)
     {
@@ -468,58 +477,252 @@ static int testCrush()
 }
 
 
-static int testClipKey()
+// A steady tone through the engine. Levels (dB re the fundamental) at r * f0 for r = 0.5, 1, 1.5 .. 12.5 (index 2r),
+// per channel and for the mono sum (index 2).
+struct ToneLevels { double lv[3][26] {}; };
+
+// vibCents > 0: a sung vibrato (5.5 Hz) - the levels are then summed over the band the overtone sweeps
+static ToneLevels measureTone (const float* v, int nch, double f0, double amp, double sr = 48000.0, double vibCents = 0.0)
 {
-    // A sung A3 into a hard-pressed clip, the song in A minor (A C E). A plain clipper adds C# (5th overtone, the major
-    // third that clashes with minor), G (7th) and B (9th). IN KEY must take those out and keep / sing the E (3rd, 6th).
-    const double sr = 48000.0, f0 = 220.0;
-    const size_t N = 65536;
+    Engine e; e.prepare (sr, nch); e.setParams (v);
+    const size_t N = 65536, n = N + 48000;
+    std::vector<std::vector<float>> io ((size_t) nch, std::vector<float> (n));
+    double ph = 0.0, jit = 0.0, jitT = 0.0;
+    std::mt19937 rng (11); std::normal_distribution<double> J (0.0, 1.0);
+    for (size_t i = 0; i < n; ++i)
+    {
+        // a sung voice: vibrato, plus a little period-to-period jitter (0.3%)
+        if (vibCents > 0.0 && (i % (size_t) (sr / f0)) == 0) jitT = 0.003 * J (rng);
+        jit += (jitT - jit) * 0.02;
+        const double f = f0 * std::pow (2.0, vibCents / 1200.0 * std::sin (2 * kPiD * 5.5 * (double) i / sr)) * (1.0 + jit);
+        ph += 2 * kPiD * f / sr;
+        const float x = (float) (amp * std::sin (ph));
+        for (auto& c : io) c[i] = x;
+    }
+    runEngine (e, io, sr, 95.0);
+    ToneLevels t;
+    const double binHz = sr / (double) N;
+    for (int c = 0; c < 3; ++c)
+    {
+        if (c == 1 && nch < 2) continue;
+        std::vector<double> x (N);
+        for (size_t i = 0; i < N; ++i)
+        {
+            const double s = c == 2 ? 0.5 * (io[0][i + 48000] + io[(size_t) (nch - 1)][i + 48000]) : io[(size_t) c][i + 48000];
+            x[i] = s * (0.35875 - 0.48829 * std::cos (2 * kPiD * i / (N - 1)) + 0.14128 * std::cos (4 * kPiD * i / (N - 1))
+                        - 0.01168 * std::cos (6 * kPiD * i / (N - 1)));
+        }
+        std::vector<double> mag; fftMag (x, mag);
+        double ref = 0;
+        for (int r2 = 1; r2 <= 25; ++r2)
+        {
+            const double fc = 0.5 * r2 * f0;
+            const int b = (int) std::lround (fc / binHz);
+            double m = 0;
+            if (vibCents > 0.0)
+            {   // energy over the swept band
+                const int w = 4 + (int) std::ceil (fc * (std::pow (2.0, vibCents / 1200.0) - 1.0) / binHz);
+                for (int q = b - w; q <= b + w; ++q) m += mag[(size_t) q];
+            }
+            else
+                for (int q = b - 4; q <= b + 4; ++q) m = std::max (m, mag[(size_t) q]);
+            t.lv[c][r2] = 10 * std::log10 (m + 1e-30);   // mag is power
+            if (r2 == 2) ref = t.lv[c][r2];
+        }
+        for (int r2 = 1; r2 <= 25; ++r2) t.lv[c][r2] -= ref;
+    }
+    return t;
+}
+
+static int testMelodic()
+{
+    // A sung A3, the song in A minor (A C E). Every distortion adds C# (5th overtone: the major third that clashes
+    // with minor), G (7th) and B (9th). With Dirt at 0 MAVKA must take those out - across the WHOLE core
+    // (crusher, lamp, glass, fold, clip) - and keep / sing the E (3rd, 6th, 12th) and the octaves.
+    const double f0 = 220.0;
     const char* names[13] = { "", "A", "A", "E", "A", "C#", "E", "G-", "A", "B", "C#", "D#-", "E" };
     const bool fits[13]  = { false, true, true, true, true, false, true, false, true, false, false, false, true };
     bool allOk = true;
-    for (float osChoice : { 3.0f, 1.0f, 5.0f })   // 4x (the usual), 1x and 16x: the filters step at different rates
+    auto drop = [] (const ToneLevels& p, const ToneLevels& m, int h) { return p.lv[0][2 * h] - m.lv[0][2 * h]; };
+
+    // 1. the clip alone, hard pressed, at 4x (the usual), 1x and 16x: the filters step at different rates;
+    //    then a sung vibrato (+-40 cents) at 4x
+    for (float osChoice : { 3.0f, 1.0f, 5.0f, 13.0f })
     {
-    double lv[2][13] = {};
+        const double vib = osChoice > 10.0f ? 40.0 : 0.0;
+        if (osChoice > 10.0f) osChoice = 3.0f;
+        float v[P_COUNT]; linearParams (v);
+        v[P_CLIP] = 0.9f; v[P_GRIT] = 0.6f; v[P_SHOULDER] = 1.0f - 0.36f; v[P_DRIVE] = 0.3f;
+        v[P_KEY] = 9.0f; v[P_CHORD] = 3.0f; v[P_OS] = osChoice;
+        const ToneLevels plain = measureTone (v, 1, f0, 0.3, 48000.0, vib);
+        v[P_SING] = 1.2f; v[P_DIRT] = 0.0f;
+        const ToneLevels mel = measureTone (v, 1, f0, 0.3, 48000.0, vib);
+        if (osChoice > 2.5f && osChoice < 3.5f && vib <= 0.0)
+        {
+            std::printf ("MELODIC test 1: A3 into a hard clip, song in A minor (A C E)\n  overtone  note  in chord   plain clip   Sing 120%% Dirt 0\n");
+            for (int h = 2; h <= 12; ++h)
+                std::printf ("  %5d     %-4s  %-8s  %7.1f dB   %7.1f dB\n", h, names[h], fits[h] ? "yes" : "no",
+                             plain.lv[0][2 * h], mel.lv[0][2 * h]);
+        }
+        const double d5 = drop (plain, mel, 5), d7 = drop (plain, mel, 7), d9 = drop (plain, mel, 9), k3 = -drop (plain, mel, 3);
+        std::printf ("  %2dx%s: C# %.1f dB lower, G %.1f dB lower, B %.1f dB lower, E %+.1f dB\n", 1 << ((int) osChoice - 1),
+                     vib > 0.0 ? " with a 40-cent vibrato" : "", d5, d7, d9, k3);
+        allOk = allOk && d5 > (vib > 0.0 ? 15.0 : 30.0) && d7 > (vib > 0.0 ? 12.0 : 30.0) && k3 > 0.5;
+    }
+
+    // 2. the whole core, factory presets (Auto oversampling): Dirt 0 against the plain distortion
+    std::printf ("MELODIC test 2: the whole core, A3 in A minor, Dirt 0 against the plain distortion\n");
+    std::printf ("  preset          C#(5)    G(7)     B(9)     C#(10)   E(3) kept   half-way products C#5 / G5 / B5\n");
+    for (const char* name : { "Mavka", "Likho", "Pressure", "Torn Tape", "Glass Harp" })
+    {
+        int pc = 0; const Preset* pl = factoryPresets (pc);
+        int idx = 0; for (int i = 0; i < pc; ++i) if (std::string (pl[i].name) == name) idx = i;
+        float v[P_COUNT]; presetValues (idx, v);
+        v[P_KEY] = 9.0f; v[P_CHORD] = 3.0f; v[P_PRISM] = 0.0f;
+        v[P_ECHO] = 0.0f; v[P_FOREST] = 0.0f; v[P_TWIN] = 0.0f; v[P_LIGATURE] = 0.0f; v[P_MELODY] = 0.0f; v[P_FLANGE] = 0.0f;
+        float vp[P_COUNT]; std::copy (v, v + P_COUNT, vp); plainDistortion (vp);
+        const ToneLevels plain = measureTone (vp, 1, f0, 0.2);
+        v[P_DIRT] = 0.0f; v[P_FORCE] = 0.0f;
+        const ToneLevels mel = measureTone (v, 1, f0, 0.2);
+        std::printf ("  %-13s %6.1f   %6.1f   %6.1f   %6.1f   %+6.1f      %6.1f %6.1f %6.1f (plain %5.1f %5.1f %5.1f)\n", name,
+                     drop (plain, mel, 5), drop (plain, mel, 7), drop (plain, mel, 9), drop (plain, mel, 10), -drop (plain, mel, 3),
+                     mel.lv[0][5], mel.lv[0][7], mel.lv[0][9], plain.lv[0][5], plain.lv[0][7], plain.lv[0][9]);
+        allOk = allOk && drop (plain, mel, 5) > 12.0;
+    }
+
+    // 3. loud AND clean: everything slammed, Dirt 0, Force 0
+    {
+        float v[P_COUNT]; linearParams (v);
+        v[P_DRIVE] = 1.0f; v[P_GRIT] = 1.0f; v[P_SHOULDER] = 0.0f; v[P_CLIP] = 1.0f; v[P_FOLD] = 0.6f; v[P_GLASS] = 0.6f;
+        v[P_KEY] = 9.0f; v[P_CHORD] = 3.0f; v[P_OS] = 0.0f;
+        const ToneLevels plain = measureTone (v, 1, f0, 0.3);
+        v[P_SING] = 1.0f; v[P_DIRT] = 0.0f;
+        const ToneLevels mel = measureTone (v, 1, f0, 0.3);
+        std::printf ("MELODIC test 3: loud and clean (drive, grit, clip, fold all up): C# %.1f dB lower, G %.1f, B %.1f, E %+.1f\n",
+                     drop (plain, mel, 5), drop (plain, mel, 7), drop (plain, mel, 9), -drop (plain, mel, 3));
+        allOk = allOk && drop (plain, mel, 5) > 12.0;
+    }
+
+    // 4. the overtone map: one overtone dragged up, another one down
+    {
+        float v[P_COUNT]; linearParams (v);
+        v[P_CLIP] = 0.9f; v[P_GRIT] = 0.6f; v[P_SHOULDER] = 0.64f; v[P_DRIVE] = 0.3f; v[P_KEY] = 9.0f; v[P_CHORD] = 3.0f; v[P_OS] = 3.0f;
+        const ToneLevels plain = measureTone (v, 1, f0, 0.3);
+        v[P_OT5] = 12.0f; v[P_OT3] = -30.0f;
+        const ToneLevels map = measureTone (v, 1, f0, 0.3);
+        const double up5 = -drop (plain, map, 5), down3 = drop (plain, map, 3), d7 = drop (plain, map, 7);
+        std::printf ("MELODIC test 4: overtone map  5th +12 dB -> %+.1f dB, 3rd -30 dB -> %+.1f dB, untouched 7th %+.1f dB\n", up5, -down3, -d7);
+        allOk = allOk && up5 > 10.0 && down3 > 24.0 && std::fabs (d7) < 1.5;
+    }
+
+    // 5. Prism: the chord tones refract between the channels, the mono sum stays
+    {
+        float v[P_COUNT]; linearParams (v);
+        v[P_CLIP] = 0.9f; v[P_GRIT] = 0.6f; v[P_SHOULDER] = 0.64f; v[P_DRIVE] = 0.3f; v[P_KEY] = 9.0f; v[P_CHORD] = 3.0f; v[P_OS] = 3.0f;
+        v[P_SING] = 1.6f; v[P_DIRT] = 1.0f;
+        const ToneLevels flat = measureTone (v, 2, f0, 0.3);
+        v[P_PRISM] = 1.0f;
+        const ToneLevels pr = measureTone (v, 2, f0, 0.3);
+        double worstMono = 0, bestSpread = 0;
+        for (int h : { 2, 3, 4, 6, 8, 12 })
+        {
+            worstMono = std::max (worstMono, std::fabs (pr.lv[2][2 * h] - flat.lv[2][2 * h]));
+            bestSpread = std::max (bestSpread, std::fabs (pr.lv[0][2 * h] - pr.lv[1][2 * h]));
+        }
+        std::printf ("MELODIC test 5: Prism 100%%: chord tones up to %.1f dB apart between L and R, mono sum within %.2f dB\n",
+                     bestSpread, worstMono);
+        allOk = allOk && bestSpread > 6.0 && worstMono < 1.5;
+    }
+
+    std::printf (allOk ? "MELODIC: OK (the whole core only adds notes of the chord; dirt is a choice)\n" : "MELODIC: CHECK\n");
+    return allOk ? 0 : 1;
+}
+
+// diagnostics: a steady A3 through a preset (+ --set overrides), levels at every half overtone
+static int toneSpectrum (int preset, const std::vector<std::string>& sets)
+{
+    float v[P_COUNT]; presetValues (preset, v);
+    v[P_KEY] = 9.0f; v[P_CHORD] = 3.0f;
+    for (const auto& kv : sets)
+    {
+        const size_t eq = kv.find ('=');
+        const int p = eq == std::string::npos ? -1 : findParam (kv.substr (0, eq).c_str());
+        if (p >= 0) v[p] = (float) std::atof (kv.substr (eq + 1).c_str());
+    }
+    const ToneLevels t = measureTone (v, 1, 220.0, 0.2);
+    const char* nm[26] = { "", "A2", "A3", "E4", "A4", "C#5", "E5", "G5", "A5", "B5", "C#6", "D#6", "E6", "F#6", "G6-",
+                           "G#6", "A6", "A#6", "B6", "C7", "C#7", "D7", "D#7-", "D#7", "E7", "F7" };
+    for (int r2 = 1; r2 <= 25; ++r2)
+        std::printf ("  %4.1f x f0  %-5s %7.1f dB\n", 0.5 * r2, nm[r2], t.lv[0][r2]);
+    return 0;
+}
+
+static int testReverbSafe()
+{
+    // words of an A3 (a sung "aa" with an attack), Dirt 100%: Reverb safe must keep the dirt to the attacks
+    // and send no rumble / narrower lows on
+    const double sr = 48000.0, f0 = 220.0;
+    const size_t word = (size_t) (0.9 * sr), gap = (size_t) (0.35 * sr), words = 6, n = words * (word + gap);
+    std::vector<float> src (n, 0.0f);
+    std::mt19937 rng (3); std::normal_distribution<float> G (0.0f, 1.0f);
+    for (size_t w = 0; w < words; ++w)
+        for (size_t i = 0; i < word; ++i)
+        {
+            const double t = (double) i / sr, env = std::min (1.0, t / 0.01) * std::min (1.0, (double) (word - i) / (0.02 * sr));
+            // a voice without a 5th overtone of its own: every C# in the output is what the distortion added
+            double x = 0; for (int h : { 1, 2, 3, 4, 6 }) x += std::sin (2 * kPiD * f0 * h * t + 0.4 * h) / (h * h);
+            src[w * (word + gap) + i] = (float) (0.25 * env * x + 0.002 * G (rng));
+        }
+    for (size_t i = 0; i < n; ++i)   // and some rumble under it all (the reverb must not get it)
+        src[i] += (float) (0.01 * std::sin (2 * kPiD * 50.0 * (double) i / sr));
+    double lowDb[2] = {}, sideDb[2] = {}, dirtSus[2] = {}, dirtAtk[2] = {};
     for (int pass = 0; pass < 2; ++pass)
     {
-        Engine e; e.prepare (sr, 1);
-        float v[P_COUNT]; linearParams (v);
-        v[P_CLIP] = 0.9f; v[P_GRIT] = 0.6f; v[P_DRIVE] = 0.3f;
-        v[P_KEY] = 9.0f; v[P_CHORD] = 3.0f;
-        v[P_CLIPKEY] = pass == 0 ? 0.0f : 1.0f; v[P_OS] = osChoice;
+        Engine e; e.prepare (sr, 2);
+        float v[P_COUNT]; defaultValues (v);
+        v[P_KEY] = 9.0f; v[P_CHORD] = 3.0f; v[P_MIX] = 1.0f; v[P_DIRT] = 1.0f; v[P_FORCE] = 0.0f; v[P_DRIVE] = 0.6f;
+        v[P_GHOSTDOWN] = 0.4f; v[P_REVSAFE] = pass == 1 ? 1.0f : 0.0f; v[P_ECHO] = 0.0f; v[P_FOREST] = 0.0f;
+        v[P_MELODY] = 0.0f; v[P_FLANGE] = 0.0f; v[P_TWIN] = 0.0f;   // the core alone (the strings have overtones of their own)
         e.setParams (v);
-        const size_t n = N + 48000;
-        std::vector<std::vector<float>> io (1, std::vector<float> (n));
-        for (size_t i = 0; i < n; ++i)
-            io[0][i] = (float) (0.3 * std::sin (2 * kPiD * f0 * (double) i / sr));
+        std::vector<std::vector<float>> io (2, src);
         runEngine (e, io, sr, 95.0);
-        std::vector<double> x (N);
-        for (size_t i = 0; i < N; ++i)
-            x[i] = io[0][i + 48000] * (0.35875 - 0.48829 * std::cos (2 * kPiD * i / (N - 1)) + 0.14128 * std::cos (4 * kPiD * i / (N - 1)) - 0.01168 * std::cos (6 * kPiD * i / (N - 1)));
-        std::vector<double> mag; fftMag (x, mag);
-        const double binHz = sr / (double) N;
-        for (int h = 1; h <= 12; ++h)
+        const size_t lat = (size_t) e.getLatency();
+        double side = 0, mid = 0;
+        std::complex<double> hum = 0, fund = 0;
+        for (size_t i = lat + (size_t) sr; i < n; ++i)
         {
-            const int c = (int) std::lround (h * f0 / binHz);
-            double m = 0; for (int b = c - 4; b <= c + 4; ++b) m = std::max (m, mag[(size_t) b]);
-            lv[pass][h] = 20 * std::log10 (m + 1e-30);
+            const double m = 0.5 * (io[0][i] + io[1][i]), sd = 0.5 * (io[0][i] - io[1][i]);
+            side += sd * sd; mid += m * m;
+            hum += m * std::exp (std::complex<double> (0, -2 * kPiD * 50.0 * (double) i / sr));
+            fund += m * std::exp (std::complex<double> (0, -2 * kPiD * f0 * (double) i / sr));
+        }
+        lowDb[pass] = 20 * std::log10 (std::abs (hum) / std::abs (fund));
+        sideDb[pass] = 10 * std::log10 (side / mid);
+        // C# (5th overtone) in the attack (first 120 ms) and in the body (400 .. 740 ms) of the last 4 words
+        auto csharp = [&] (size_t start, size_t len)
+        {
+            std::vector<double> x (8192, 0.0);
+            for (size_t i = 0; i < len && i < 8192; ++i)
+                x[i] = 0.5 * (io[0][start + i] + io[1][start + i]) * (0.5 - 0.5 * std::cos (2 * kPiD * i / (len - 1)));
+            std::vector<double> mag; fftMag (x, mag);
+            const double binHz = sr / 8192.0;
+            auto pk = [&] (double f) { const int b = (int) std::lround (f / binHz); double m = 0; for (int q = b - 2; q <= b + 2; ++q) m = std::max (m, mag[(size_t) q]); return m; };
+            return 10 * std::log10 (pk (5 * f0) / pk (f0));
+        };
+        for (size_t w = 2; w < words; ++w)
+        {
+            const size_t s0 = w * (word + gap) + lat;
+            dirtAtk[pass] += csharp (s0, (size_t) (0.12 * sr)) / 4.0;
+            dirtSus[pass] += csharp (s0 + (size_t) (0.40 * sr), (size_t) (0.34 * sr)) / 4.0;
         }
     }
-    const int factor = 1 << ((int) osChoice - 1);
-    if (osChoice > 2.5f && osChoice < 3.5f)
-    {
-        std::printf ("IN KEY test: A3 into a hard clip, song in A minor (A C E)\n  overtone  note  in chord   plain clip   IN KEY\n");
-        for (int h = 2; h <= 12; ++h)
-            std::printf ("  %5d     %-4s  %-8s  %7.1f dB   %7.1f dB\n", h, names[h], fits[h] ? "yes" : "no",
-                         lv[0][h] - lv[0][1], lv[1][h] - lv[1][1]);
-    }
-    const double drop5 = (lv[0][5] - lv[0][1]) - (lv[1][5] - lv[1][1]), drop7 = (lv[0][7] - lv[0][1]) - (lv[1][7] - lv[1][1]);
-    const double keep3 = (lv[1][3] - lv[1][1]) - (lv[0][3] - lv[0][1]);
-    std::printf ("  %2dx: C# (clashing major third) %.1f dB lower, G %.1f dB lower, E %+.1f dB\n", factor, drop5, drop7, keep3);
-    allOk = allOk && drop5 > 8.0 && drop7 > 6.0 && keep3 > -1.0;
-    }
-    std::printf (allOk ? "CLIPKEY: OK (the clip only adds notes of the chord)\n" : "CLIPKEY: CHECK\n");
-    return allOk ? 0 : 1;
+    std::printf ("REVERB SAFE: 50 Hz rumble %.1f -> %.1f dB re the note, side %.1f -> %.1f dB re mid\n", lowDb[0], lowDb[1], sideDb[0], sideDb[1]);
+    std::printf ("  dirt (C#) in the attack %.1f -> %.1f dB, in the body of the word %.1f -> %.1f dB re the note\n",
+                 dirtAtk[0], dirtAtk[1], dirtSus[0], dirtSus[1]);
+    const bool ok = lowDb[1] < lowDb[0] - 8.0 && sideDb[1] < sideDb[0] - 2.0 && dirtSus[1] < dirtSus[0] - 10.0
+                    && dirtAtk[1] > dirtAtk[0] - 6.0;
+    std::printf (ok ? "REVERBSAFE: OK (dirt only on the attacks, clean lows and sides)\n" : "REVERBSAFE: CHECK\n");
+    return ok ? 0 : 1;
 }
 
 static int testFlange()
@@ -596,6 +799,92 @@ static int render (const std::string& inPath, const std::string& outPath, int pr
     return 0;
 }
 
+// POLISH check on a real vocal: at several Mix / Drive points - how much of what MAVKA adds is dirt (non-chord
+// overtones), how dense the result is against the dry voice, how wide, how much top
+static int polish (const std::string& inPath, int preset, double bpm, const std::vector<std::string>& sets)
+{
+    Audio a;
+    if (! readWav (inPath, a)) { std::fprintf (stderr, "cannot read %s\n", inPath.c_str()); return 1; }
+    if (a.ch.size() == 1) a.ch.push_back (a.ch[0]);
+    const size_t n = a.frames();
+    std::vector<char> sungMask;   // the frames where the DRY voice sings (the same frames for every render)
+    auto stats = [&] (const std::vector<std::vector<float>>& io, double& crest, double& dynStd, double& sideDb, double& hfDb)
+    {
+        double peak = 0, sum = 0, side = 0, mid = 0, hf = 0;
+        Biquad hp; hp.highpass (7000.0, 0.707, a.sr);
+        std::vector<double> frames;
+        const size_t fl = (size_t) (0.03 * a.sr);
+        double fe = 0; size_t fc = 0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            const double m = 0.5 * (io[0][i] + io[1][i]), sd = 0.5 * (io[0][i] - io[1][i]);
+            peak = std::max (peak, std::fabs (m)); sum += m * m; mid += m * m; side += sd * sd;
+            const double h = hp.process ((float) m); hf += h * h;
+            fe += m * m;
+            if (++fc == fl) { frames.push_back (10 * std::log10 (fe / (double) fl + 1e-12)); fe = 0; fc = 0; }
+        }
+        crest = 20 * std::log10 (peak / std::sqrt (sum / (double) n));
+        sideDb = 10 * std::log10 (side / mid + 1e-12);
+        hfDb = 10 * std::log10 (hf / mid + 1e-12);
+        if (sungMask.empty())
+        {
+            double top = -200; for (double f : frames) top = std::max (top, f);
+            for (double f : frames) sungMask.push_back (f > top - 25.0 ? 1 : 0);
+        }
+        std::vector<double> sung;
+        for (size_t i = 0; i < frames.size() && i < sungMask.size(); ++i) if (sungMask[i]) sung.push_back (frames[i]);
+        std::sort (sung.begin(), sung.end());
+        // how far the quiet sung moments sit under the loud ones (10th .. 90th percentile)
+        dynStd = sung.size() > 10 ? sung[sung.size() * 9 / 10] - sung[sung.size() / 10] : 0.0;
+    };
+    double dC, dD, dS, dH;
+    stats (a.ch, dC, dD, dS, dH);
+    std::printf ("dry voice: crest %.1f dB, syllable spread %.2f dB, side %.1f dB, top (>7k) %.1f dB\n", dC, dD, dS, dH);
+    std::printf ("  mix  drive | dirt share  chord tones | crest   spread   top     side (re mid)\n");
+    const float mixes[] = { 0.15f, 0.25f, 0.45f, 1.0f, 0.25f, 0.25f, 0.25f };
+    const float drives[] = { -1.0f, -1.0f, -1.0f, -1.0f, 0.10f, 0.60f, -1.0f };
+    for (int pass = 0; pass < 7; ++pass)
+    {
+        const bool plain = pass == 6;
+        const int q = pass;
+        float v[P_COUNT]; presetValues (preset, v);
+        for (auto& st : sets)
+        {
+            const auto eq = st.find ('=');
+            const int p = findParam (st.substr (0, eq).c_str());
+            if (p >= 0) v[p] = (float) std::atof (st.substr (eq + 1).c_str());
+        }
+        v[P_MIX] = mixes[q];
+        if (drives[q] >= 0.0f) v[P_DRIVE] = drives[q];
+        if (plain) plainDistortion (v);
+        Engine e; e.prepare (a.sr, 2); e.setNonRealtime (true); e.setParams (v); e.setMetering (true);
+        auto io = a.ch;
+        for (auto& c : io) c.insert (c.end(), (size_t) e.getLatency(), 0.0f);
+        double dirtAcc = 0, melAcc = 0; int blocks = 0;
+        runEngine (e, io, a.sr, bpm, 512, [&] (size_t)
+        {
+            Engine::OvertoneView ov; e.getOvertones (ov);
+            if (ov.conf < 0.6f) return;
+            double tot = 0, dirt = 0, mel = 0;
+            for (int h = 0; h < InnerControls::kBands; ++h)
+            {
+                if (h >= InnerControls::kHarm && ! ov.halves) break;
+                const double pw = std::pow (10.0, 0.1 * ov.level[h]) * ov.gain[h] * ov.gain[h];
+                tot += pw; dirt += pw * (1.0 - ov.fit[h]); mel += pw * ov.fit[h];
+            }
+            if (tot <= 0) return;
+            dirtAcc += dirt / tot; melAcc += 10 * std::log10 (mel + 1e-12); ++blocks;
+        });
+        for (auto& c : io) c.erase (c.begin(), c.begin() + e.getLatency());
+        double c, d, sd, h;
+        stats (io, c, d, sd, h);
+        std::printf ("  %3.0f%%  %3.0f%%  | %6.1f%%    %7.1f dB  | %+5.1f   %+5.2f   %+5.1f   %6.1f dB  %s\n", 100 * v[P_MIX], 100 * v[P_DRIVE],
+                     blocks ? 100.0 * dirtAcc / blocks : 0.0, blocks ? melAcc / blocks : -120.0, c - dC, d - dD, h - dH, sd,
+                     plain ? "(plain distortion)" : "");
+    }
+    return 0;
+}
+
 int main (int argc, char** argv)
 {
     noDenormals();
@@ -610,7 +899,8 @@ int main (int argc, char** argv)
     if (cmd == "duck")    return testDuck();
     if (cmd == "crush")   return testCrush();
     if (cmd == "flange")  return testFlange();
-    if (cmd == "clipkey") return testClipKey();
+    if (cmd == "melodic" || cmd == "clipkey") return testMelodic();
+    if (cmd == "reverbsafe") return testReverbSafe();
     double bpm = 95.0; std::vector<std::string> sets;
     std::vector<std::string> pos;
     for (int i = 2; i < argc; ++i)
@@ -621,6 +911,8 @@ int main (int argc, char** argv)
         else pos.push_back (s);
     }
     if (cmd == "duckstats" && pos.size() >= 1) return duckStats (pos[0], bpm);
+    if (cmd == "tone" && pos.size() >= 1) return toneSpectrum (findPreset (pos[0]), sets);
+    if (cmd == "polish" && pos.size() >= 2) return polish (pos[0], findPreset (pos[1]), bpm, sets);
     if (cmd == "render" && pos.size() >= 3) return render (pos[0], pos[1], findPreset (pos[2]), bpm, sets);
     if (cmd == "renderall" && pos.size() >= 2)
     {
