@@ -57,6 +57,22 @@ public:
     void drawCornerResizer (juce::Graphics&, int w, int h, bool isMouseOver, bool isMouseDragging) override;
 };
 
+// type a value: double-click the number under a knob or fader (or right-click the control) and write it
+class ValueEntry
+{
+public:
+    void attach (juce::Component& owner, juce::Slider& s, float fontSize);
+    void open (juce::Rectangle<int> where);
+    bool isOpen() const noexcept { return editor.isVisible(); }
+    void type (const juce::String& text);   // as if typed and confirmed with Return
+
+private:
+    void finish (bool apply);
+    juce::Component* owner = nullptr;
+    juce::Slider* slider = nullptr;
+    juce::TextEditor editor;
+};
+
 // a knob's slider: hold Shift while you grab it for a 10x finer turn; right-click to type a value
 class KnobSlider final : public juce::Slider
 {
@@ -75,18 +91,19 @@ public:
           bool large, const juce::String& tooltip);
     void paint (juce::Graphics&) override;
     void resized() override;
+    void mouseDoubleClick (const juce::MouseEvent&) override;
     juce::Rectangle<int> getTitleArea() const { return titleArea; }
     juce::Rectangle<int> getValueArea() const { return valueArea; }
+    void enterValue (const juce::String& text) { entry.type (text); }
 
     KnobSlider slider;
 
 private:
-    void typeIn();
-    void finishTyping (bool apply);
+    juce::Rectangle<int> numberArea() const;
     juce::String title;
     bool large;
     juce::Rectangle<int> titleArea, valueArea;
-    juce::TextEditor editor;
+    ValueEntry entry;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attachment;
 };
 
@@ -97,12 +114,15 @@ public:
            const juce::String& tooltip);
     void paint (juce::Graphics&) override;
     void resized() override;
+    void mouseDoubleClick (const juce::MouseEvent&) override;
+    void enterValue (const juce::String& text) { entry.type (text); }
 
-    juce::Slider slider;
+    KnobSlider slider;
 
 private:
     juce::String title;
     juce::Rectangle<int> titleArea, valueArea;
+    ValueEntry entry;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attachment;
 };
 

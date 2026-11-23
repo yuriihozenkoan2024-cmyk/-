@@ -1,4 +1,5 @@
 // Headless check of the JUCE wrapper: instantiate, process, presets, state round-trip, editor snapshot.
+#include <functional>
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include <juce_audio_formats/juce_audio_formats.h>
@@ -190,6 +191,33 @@ int main (int argc, char** argv)
             std::printf ("  second editor opened in %.0f ms (textures cached)\n", juce::Time::getMillisecondCounterHiRes() - t2);
         }
         ed->setSize (MavkaAudioProcessorEditor::baseW * 7 / 10, MavkaAudioProcessorEditor::baseH * 7 / 10);
+
+        // typing a value: double-click the number under a knob / fader and write it
+        {
+            std::function<juce::Component* (juce::Component&, const juce::String&)> find = [&] (juce::Component& c, const juce::String& id)
+                -> juce::Component*
+            {
+                for (auto* child : c.getChildren())
+                {
+                    if (child->getComponentID() == id) return child;
+                    if (auto* r = find (*child, id)) return r;
+                }
+                return nullptr;
+            };
+            auto* detune = dynamic_cast<mavkaui::Knob*> (find (*ed, "detune"));
+            auto* echo = dynamic_cast<mavkaui::Fader*> (find (*ed, "echo"));
+            bool typed = detune != nullptr && echo != nullptr;
+            if (typed)
+            {
+                detune->enterValue ("447");
+                echo->enterValue ("25%");
+                typed = std::abs (p.apvts.getRawParameterValue ("detune")->load() - 27.31f) < 0.05f
+                        && std::abs (p.apvts.getRawParameterValue ("echo")->load() - 0.25f) < 1.0e-3f;
+                detune->enterValue ("440 Hz");
+                echo->enterValue ("50%");
+            }
+            check (typed, "typing a value into a knob (Detune: 447) and a fader (Echo: 25%) sets it exactly");
+        }
 
         juce::AudioBuffer<float> voice;
         if (argc > 2)

@@ -1308,6 +1308,14 @@ Fader::Fader (juce::AudioProcessorValueTreeState& state, const juce::String& par
     if (auto* p = state.getParameter (paramId))
         slider.setDoubleClickReturnValue (true, (double) p->convertFrom0to1 (p->getDefaultValue()));
     slider.onValueChange = [this] { repaint (valueArea); };
+    entry.attach (*this, slider, 11.0f);
+    slider.onTypeIn = [this] { entry.open (valueArea); };
+}
+
+void Fader::mouseDoubleClick (const juce::MouseEvent& e)
+{
+    if (valueArea.expanded (2).contains (e.getPosition()))
+        entry.open (valueArea);
 }
 
 void Fader::resized()
@@ -1323,9 +1331,64 @@ void Fader::paint (juce::Graphics& g)
     g.setColour (theme::ink.withAlpha (0.86f));
     g.setFont (sans (11.5f, true, 0.14f));
     g.drawFittedText (title.toUpperCase(), titleArea, juce::Justification::centred, 1, 0.75f);
+    if (entry.isOpen())
+        return;
     g.setColour (theme::inkSoft);
     g.setFont (numbers (11.0f));
     g.drawFittedText (slider.getTextFromValue (slider.getValue()), valueArea, juce::Justification::centred, 1, 0.8f);
+}
+
+//==============================================================================
+void ValueEntry::attach (juce::Component& c, juce::Slider& s, float fontSize)
+{
+    owner = &c;
+    slider = &s;
+    editor.setJustification (juce::Justification::centred);
+    editor.setFont (numbers (fontSize));
+    editor.setColour (juce::TextEditor::backgroundColourId, theme::paperHi);
+    editor.setColour (juce::TextEditor::textColourId, theme::ink);
+    editor.setColour (juce::TextEditor::highlightColourId, theme::hair);
+    editor.setColour (juce::TextEditor::outlineColourId, theme::inkSoft);
+    editor.setColour (juce::TextEditor::focusedOutlineColourId, theme::ink);
+    editor.setSelectAllWhenFocused (true);
+    editor.onReturnKey = [this] { finish (true); };
+    editor.onEscapeKey = [this] { finish (false); };
+    editor.onFocusLost = [this] { finish (true); };
+    c.addChildComponent (editor);
+}
+
+void ValueEntry::open (juce::Rectangle<int> where)
+{
+    if (owner == nullptr || slider == nullptr)
+        return;
+    editor.setBounds (where.expanded (4, 2));
+    editor.setText (slider->getTextFromValue (slider->getValue()), juce::dontSendNotification);
+    editor.setVisible (true);
+    editor.toFront (false);
+    editor.grabKeyboardFocus();
+    editor.selectAll();
+    owner->repaint();
+}
+
+void ValueEntry::type (const juce::String& text)
+{
+    if (owner == nullptr)
+        return;
+    open (owner->getLocalBounds().withSizeKeepingCentre (60, 16));
+    editor.setText (text, juce::dontSendNotification);
+    finish (true);
+}
+
+void ValueEntry::finish (bool apply)
+{
+    if (! editor.isVisible() || slider == nullptr)
+        return;
+    const auto text = editor.getText().trim();
+    editor.setVisible (false);
+    if (apply && text.isNotEmpty())
+        slider->setValue (slider->getValueFromText (text), juce::sendNotificationSync);
+    if (owner != nullptr)
+        owner->repaint();
 }
 
 //==============================================================================
@@ -1340,18 +1403,8 @@ Knob::Knob (juce::AudioProcessorValueTreeState& state, const juce::String& param
     slider.getProperties().set ("large", large);
     slider.sensitivity = large ? 260 : 200;
     slider.setMouseDragSensitivity (slider.sensitivity);
-    slider.onTypeIn = [this] { typeIn(); };
-    editor.setJustification (juce::Justification::centred);
-    editor.setFont (numbers (large ? 12.0f : 11.0f));
-    editor.setColour (juce::TextEditor::backgroundColourId, theme::paperHi);
-    editor.setColour (juce::TextEditor::textColourId, theme::ink);
-    editor.setColour (juce::TextEditor::highlightColourId, theme::hair);
-    editor.setColour (juce::TextEditor::outlineColourId, theme::inkSoft);
-    editor.setColour (juce::TextEditor::focusedOutlineColourId, theme::ink);
-    editor.onReturnKey = [this] { finishTyping (true); };
-    editor.onEscapeKey = [this] { finishTyping (false); };
-    editor.onFocusLost = [this] { finishTyping (true); };
-    addChildComponent (editor);
+    entry.attach (*this, slider, large ? 12.0f : 11.0f);
+    slider.onTypeIn = [this] { entry.open (valueArea); };
     slider.setTooltip (tooltip);
     addAndMakeVisible (slider);
 
@@ -1378,7 +1431,7 @@ void Knob::paint (juce::Graphics& g)
     g.setColour (theme::ink.withAlpha (0.86f));
     g.setFont (sans (large ? 12.0f : 11.0f, true, 0.12f));
     g.drawFittedText (title.toUpperCase(), titleArea, juce::Justification::centred, 1, 0.75f);
-    if (editor.isVisible())
+    if (entry.isOpen())
         return;
     g.setColour (theme::inkSoft);
     g.setFont (numbers (large ? 12.0f : 11.0f));
@@ -1419,25 +1472,16 @@ void KnobSlider::mouseUp (const juce::MouseEvent& e)
     setMouseDragSensitivity (sensitivity);
 }
 
-void Knob::typeIn()
+// the number under the knob (and Detune's cents line): double-click it to type a value
+juce::Rectangle<int> Knob::numberArea() const
 {
-    editor.setBounds (valueArea.expanded (4, 2).withHeight (valueArea.getHeight() + 4));
-    editor.setText (slider.getTextFromValue (slider.getValue()), juce::dontSendNotification);
-    editor.setVisible (true);
-    editor.grabKeyboardFocus();
-    editor.selectAll();
-    repaint();
+    return getComponentID() == "detune" ? valueArea.withHeight (valueArea.getHeight() * 2) : valueArea;
 }
 
-void Knob::finishTyping (bool apply)
+void Knob::mouseDoubleClick (const juce::MouseEvent& e)
 {
-    if (! editor.isVisible())
-        return;
-    const auto text = editor.getText().trim();
-    editor.setVisible (false);
-    if (apply && text.isNotEmpty())
-        slider.setValue (slider.getValueFromText (text), juce::sendNotificationSync);
-    repaint();
+    if (numberArea().expanded (4, 2).contains (e.getPosition()))
+        entry.open (valueArea);
 }
 
 //==============================================================================
@@ -2313,8 +2357,8 @@ MavkaAudioProcessorEditor::MavkaAudioProcessorEditor (MavkaAudioProcessor& p)
         addKnob (pg, "detune", "Detune", false, { 358, 56, 96, 132 },
                  "Tuning of everything that plays in key, like Detune in Auto-Tune: if your beat is tuned to A = 447 Hz, "
                  "set 447 Hz (+27.3 cents) and the harp, the forest, the Tuned flanger and the melodic distortion move with it. "
-                 "Right-click to type it exactly (447, 447 Hz, 432.5 or +27.3 ct); Shift-drag for a fine turn; "
-                 "double-click for 440. Presets never change it (nor Key and Chord).");
+                 "Double-click the number to type it exactly (447, 447 Hz, 432.5 or +27.3 ct); Shift-drag for a fine turn; "
+                 "double-click the knob for 440. Presets never change it (nor Key and Chord).");
         addKnob (pg, "decay", "Decay", false, { 462, 56, 96, 132 }, "How long the strings ring.");
         addKnob (pg, "bright", "Bright", false, { 560, 56, 96, 132 }, "String brightness.");
         addKnob (pg, "harpDrive", "Harp drive", false, { 658, 56, 96, 132 }, "Overdrive inside the strings.");
