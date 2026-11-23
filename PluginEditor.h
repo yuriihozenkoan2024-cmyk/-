@@ -57,6 +57,17 @@ public:
     void drawCornerResizer (juce::Graphics&, int w, int h, bool isMouseOver, bool isMouseDragging) override;
 };
 
+// a knob's slider: hold Shift while you grab it for a 10x finer turn; right-click to type a value
+class KnobSlider final : public juce::Slider
+{
+public:
+    std::function<void()> onTypeIn;
+    int sensitivity = 200;
+    void mouseDown (const juce::MouseEvent&) override;
+    void mouseDrag (const juce::MouseEvent&) override;
+    void mouseUp (const juce::MouseEvent&) override;
+};
+
 class Knob final : public juce::Component
 {
 public:
@@ -67,12 +78,15 @@ public:
     juce::Rectangle<int> getTitleArea() const { return titleArea; }
     juce::Rectangle<int> getValueArea() const { return valueArea; }
 
-    juce::Slider slider;
+    KnobSlider slider;
 
 private:
+    void typeIn();
+    void finishTyping (bool apply);
     juce::String title;
     bool large;
     juce::Rectangle<int> titleArea, valueArea;
+    juce::TextEditor editor;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attachment;
 };
 
@@ -216,6 +230,9 @@ private:
     juce::String key;
     float polishAmt = 0.0f, dragDb = 0.0f, dragY = 0.0f;
     int hover = -1, dragging = -1;
+
+public:
+    float a4 = 440.0f;   // the tuning reference (Detune): note names follow it
 };
 
 struct Page final : public juce::Component

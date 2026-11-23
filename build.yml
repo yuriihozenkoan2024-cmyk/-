@@ -56,6 +56,7 @@ jobs:
           "$T" flange
           "$T" melodic
           "$T" reverbsafe
+          "$T" tuning
 
       - name: Collect plugin files
         shell: bash

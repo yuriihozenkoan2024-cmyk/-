@@ -1,6 +1,7 @@
 // MAVKA - parameter table and factory presets (shared by the plugin and the offline tests)
 #pragma once
 
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 
@@ -8,7 +9,7 @@ namespace mavka
 {
 
 enum class PType { Float, Choice, Bool };
-enum class Unit  { Percent, Bipolar, Ink, Slant, Db, Hz, Ms, Sec, Tone, None };
+enum class Unit  { Percent, Bipolar, Ink, Slant, Db, Hz, Ms, Sec, Tone, Cents, None };
 
 struct ParamDef
 {
@@ -65,6 +66,8 @@ enum ParamIndex
     // gain of every overtone the distortion adds (2nd .. 12th), dragged on the overtone map
     P_OT2, P_OT3, P_OT4, P_OT5, P_OT6, P_OT7, P_OT8, P_OT9, P_OT10, P_OT11, P_OT12,
     P_REVSAFE,
+    // tuning reference of everything that plays in key (like Detune in Auto-Tune): cents from A4 = 440 Hz
+    P_DETUNE,
     P_COUNT
 };
 
@@ -160,8 +163,19 @@ inline const ParamDef* paramDefs() noexcept
         { "ot11",        "Overtone 11",   PType::Float, -30.0f, 12.0f, 0.0f,  0.0f, Unit::Db,      nullptr, 0 },
         { "ot12",        "Overtone 12",   PType::Float, -30.0f, 12.0f, 0.0f,  0.0f, Unit::Db,      nullptr, 0 },
         { "reverbSafe",  "Reverb Safe",   PType::Bool,   0.0f, 1.0f,   0.0f,  0.0f, Unit::None,    nullptr, 0 },
+        { "detune",      "Detune",        PType::Float, -100.0f, 100.0f, 0.0f, 0.0f, Unit::Cents, nullptr, 0 },
     };
     return d;
+}
+
+// Detune (cents) <-> the A4 it tunes to
+inline float detuneToA4 (float cents) noexcept { return 440.0f * std::exp2 (cents / 1200.0f); }
+inline float a4ToDetune (float hz) noexcept    { return 1200.0f * std::log2 (hz / 440.0f); }
+
+// what a preset load leaves alone: your monitoring (Oversampling, Output) and your SONG (Key, Chord, Detune)
+inline bool presetKeeps (int p) noexcept
+{
+    return p == P_OS || p == P_OUTPUT || p == P_KEY || p == P_CHORD || p == P_DETUNE;
 }
 
 inline int findParam (const char* id) noexcept

@@ -18,6 +18,7 @@ juce::String MavkaAudioProcessor::formatValue (Unit unit, float v)
         case Unit::Hz:      return v < 1000.0f ? juce::String (juce::roundToInt (v)) + " Hz" : juce::String (v / 1000.0f, 1) + " kHz";
         case Unit::Ms:      return juce::String (juce::roundToInt (v)) + " ms";
         case Unit::Sec:     return juce::String (v, v < 10.0f ? 2 : 1) + " s";
+        case Unit::Cents:   return juce::String (detuneToA4 (v), 1) + " Hz";
         case Unit::None:    break;
     }
     return juce::String (v, 2);
@@ -35,6 +36,10 @@ static float parseValue (Unit unit, const juce::String& text)
         case Unit::Slant:   return (t.contains ("fall") ? -std::abs (x) : x) / 100.0f;
         case Unit::Tone:    return (t.contains ("dark") ? -std::abs (x) : x) / 100.0f;
         case Unit::Hz:      return t.contains ("k") ? x * 1000.0f : x;
+        case Unit::Cents:   // "447", "447 Hz", "432.5hz" = A4 in Hz; "+27.3", "-12 ct", "15 cents" = cents
+            if (t.contains ("hz") || (! t.contains ("c") && std::abs (x) > 200.0f))
+                return juce::jlimit (-100.0f, 100.0f, a4ToDetune (juce::jmax (x, 1.0f)));
+            return juce::jlimit (-100.0f, 100.0f, x);
         case Unit::Db:
         case Unit::Ms:
         case Unit::Sec:
@@ -160,8 +165,8 @@ void MavkaAudioProcessor::loadFactoryPreset (int index)
     const ParamDef* defs = paramDefs();
     for (int i = 0; i < P_COUNT; ++i)
     {
-        if (i == P_OS || i == P_OUTPUT)
-            continue;   // presets keep the user's oversampling and output level
+        if (presetKeeps (i))
+            continue;   // presets keep the user's oversampling and output level, and the song's key, chord and tuning
         if (auto* p = apvts.getParameter (defs[i].id))
             p->setValueNotifyingHost (p->convertTo0to1 (v[i]));
     }

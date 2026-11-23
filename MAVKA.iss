@@ -2,7 +2,7 @@
 ; One run: the VST3 goes to C:\Program Files\Common Files\VST3, the standalone app to Program Files.
 
 #define MyAppName "MAVKA"
-#define MyAppVersion "0.5.0"
+#define MyAppVersion "0.5.1"
 #ifndef SourceDir
   #define SourceDir "..\dist"
 #endif

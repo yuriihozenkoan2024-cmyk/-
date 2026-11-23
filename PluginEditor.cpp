@@ -69,7 +69,7 @@ namespace
 
     bool isBipolar (const juce::String& id)
     {
-        return id == "ink" || id == "slant" || id == "bias" || id == "tone" || id == "preTilt" || id == "output";
+        return id == "ink" || id == "slant" || id == "bias" || id == "tone" || id == "preTilt" || id == "output" || id == "detune";
     }
 
     // the plates of the faceplate: same white, different wear
@@ -1338,7 +1338,20 @@ Knob::Knob (juce::AudioProcessorValueTreeState& state, const juce::String& param
     slider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
     slider.getProperties().set ("bipolar", isBipolar (paramId));
     slider.getProperties().set ("large", large);
-    slider.setMouseDragSensitivity (large ? 260 : 200);
+    slider.sensitivity = large ? 260 : 200;
+    slider.setMouseDragSensitivity (slider.sensitivity);
+    slider.onTypeIn = [this] { typeIn(); };
+    editor.setJustification (juce::Justification::centred);
+    editor.setFont (numbers (large ? 12.0f : 11.0f));
+    editor.setColour (juce::TextEditor::backgroundColourId, theme::paperHi);
+    editor.setColour (juce::TextEditor::textColourId, theme::ink);
+    editor.setColour (juce::TextEditor::highlightColourId, theme::hair);
+    editor.setColour (juce::TextEditor::outlineColourId, theme::inkSoft);
+    editor.setColour (juce::TextEditor::focusedOutlineColourId, theme::ink);
+    editor.onReturnKey = [this] { finishTyping (true); };
+    editor.onEscapeKey = [this] { finishTyping (false); };
+    editor.onFocusLost = [this] { finishTyping (true); };
+    addChildComponent (editor);
     slider.setTooltip (tooltip);
     addAndMakeVisible (slider);
 
@@ -1365,9 +1378,66 @@ void Knob::paint (juce::Graphics& g)
     g.setColour (theme::ink.withAlpha (0.86f));
     g.setFont (sans (large ? 12.0f : 11.0f, true, 0.12f));
     g.drawFittedText (title.toUpperCase(), titleArea, juce::Justification::centred, 1, 0.75f);
+    if (editor.isVisible())
+        return;
     g.setColour (theme::inkSoft);
     g.setFont (numbers (large ? 12.0f : 11.0f));
     g.drawFittedText (slider.getTextFromValue (slider.getValue()), valueArea, juce::Justification::centred, 1, 0.8f);
+    if (getComponentID() == "detune")
+    {
+        // the tuning in cents as well (Auto-Tune shows it this way)
+        const double c = slider.getValue();
+        g.setColour (theme::inkFaint);
+        g.setFont (numbers (10.0f));
+        g.drawText (std::abs (c) < 0.05 ? juce::String ("A4 = 440") : (c > 0 ? "+" : "") + juce::String (c, 1) + " cents",
+                    valueArea.translated (0, valueArea.getHeight()), juce::Justification::centred, false);
+    }
+}
+
+void KnobSlider::mouseDown (const juce::MouseEvent& e)
+{
+    if (e.mods.isPopupMenu())
+    {
+        if (onTypeIn) onTypeIn();
+        return;
+    }
+    setMouseDragSensitivity (e.mods.isShiftDown() ? sensitivity * 10 : sensitivity);   // Shift: fine
+    juce::Slider::mouseDown (e);
+}
+
+void KnobSlider::mouseDrag (const juce::MouseEvent& e)
+{
+    if (! e.mods.isPopupMenu())
+        juce::Slider::mouseDrag (e);
+}
+
+void KnobSlider::mouseUp (const juce::MouseEvent& e)
+{
+    if (e.mods.isPopupMenu())
+        return;
+    juce::Slider::mouseUp (e);
+    setMouseDragSensitivity (sensitivity);
+}
+
+void Knob::typeIn()
+{
+    editor.setBounds (valueArea.expanded (4, 2).withHeight (valueArea.getHeight() + 4));
+    editor.setText (slider.getTextFromValue (slider.getValue()), juce::dontSendNotification);
+    editor.setVisible (true);
+    editor.grabKeyboardFocus();
+    editor.selectAll();
+    repaint();
+}
+
+void Knob::finishTyping (bool apply)
+{
+    if (! editor.isVisible())
+        return;
+    const auto text = editor.getText().trim();
+    editor.setVisible (false);
+    if (apply && text.isNotEmpty())
+        slider.setValue (slider.getValueFromText (text), juce::sendNotificationSync);
+    repaint();
 }
 
 //==============================================================================
@@ -1592,10 +1662,10 @@ namespace
 
     const char* kNoteNames[12] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
 
-    juce::String noteName (float hz)
+    juce::String noteName (float hz, float a4 = 440.0f)
     {
         if (hz < 20.0f) return {};
-        const int midi = (int) std::lround (69.0 + 12.0 * std::log2 ((double) hz / 440.0));
+        const int midi = (int) std::lround (69.0 + 12.0 * std::log2 ((double) hz / (double) a4));
         return juce::String (kNoteNames[((midi % 12) + 12) % 12]) + juce::String (midi / 12 - 1);
     }
 }
@@ -1838,8 +1908,9 @@ void OvertoneMap::paint (juce::Graphics& g)
     // header: the sung note and the song's chord, the legend
     g.setFont (sans (10.5f, true, 0.12f));
     g.setColour (pitched ? theme::ink.withAlpha (0.86f) : theme::inkFaint);
-    const juce::String note = pitched ? noteName (view.f0) : juce::String ("no pitch");
-    g.drawText (note + u8 ("  \xc2\xb7  ") + key + (pitched ? juce::String() : juce::String ("  \xc2\xb7  plain clipping")),
+    const juce::String note = pitched ? noteName (view.f0, a4) : juce::String ("no pitch");
+    const juce::String tuning = std::abs (a4 - 440.0f) > 0.04f ? u8 ("  \xc2\xb7  A ") + juce::String (a4, 1) : juce::String();
+    g.drawText (note + u8 ("  \xc2\xb7  ") + key + tuning + (pitched ? juce::String() : juce::String ("  \xc2\xb7  plain clipping")),
                 r.withHeight (15.0f).withTrimmedLeft (2.0f), juce::Justification::centredLeft, false);
     {
         // legend, right to left: [ink] chord tones   [blood] dirt   (PLAIN / polish)
@@ -1922,7 +1993,7 @@ void OvertoneMap::paint (juce::Graphics& g)
                     juce::Justification::centred, false);
         g.setColour (pitched ? theme::inkSoft : theme::inkFaint.withAlpha (0.6f));
         g.setFont (sans (9.0f));
-        g.drawText (pitched ? noteName (view.f0 * (float) (h + 2)) : juce::String (u8 ("\xc2\xb7")),
+        g.drawText (pitched ? noteName (view.f0 * (float) (h + 2), a4) : juce::String (u8 ("\xc2\xb7")),
                     juce::Rectangle<float> (x - step * 0.5f, b.getBottom() + 13.0f, step, 11.0f), juce::Justification::centred, false);
     }
 }
@@ -2189,7 +2260,8 @@ MavkaAudioProcessorEditor::MavkaAudioProcessorEditor (MavkaAudioProcessor& p)
                            "(glassy self-modulation) and a folding diode. Ghost octaves are fed INTO them; the crusher samples in tune with your pitch.";
     pages[1].description = "Every modulator runs at a rate taken from a chord (4:5:6 = major, 10:12:15 = minor...), locked to your bars. "
                            "The movement repeats like a groove instead of drifting.";
-    pages[2].description = "Strings tuned to your song, struck by the distorted voice: a melodic halo even on rap. Set the key of your track.";
+    pages[2].description = "Strings tuned to your song, struck by the distorted voice: a melodic halo even on rap. Set the key of your "
+                           "track (like in your Auto-Tune) and, if the beat isn't tuned to 440 Hz, its tuning (Detune).";
     pages[3].description = "How MAVKA listens: the same saturation for whispers and shouts, vowels sing, consonants stay clear.";
     pages[4].description = "A flanger that plays the harp's chord. Its feedback loop saturates with Grit and it follows "
                            "the same pen (Ink), the same clock and the same key as the rest of MAVKA.";
@@ -2233,12 +2305,19 @@ MavkaAudioProcessorEditor::MavkaAudioProcessorEditor (MavkaAudioProcessor& p)
     }
     {
         auto& pg = pages[2];
-        addChoice (pg, "key", "Key", { 6, 80, 110, 44 }, "Key of your song (the harp, the forest's Tune and the Tuned flanger follow it).");
-        addChoice (pg, "chord", "Chord", { 126, 80, 130, 44 }, "Which notes the strings are tuned to.");
-        addChoice (pg, "register", "Register", { 266, 80, 110, 44 }, "Octave of the harp.");
-        addKnob (pg, "decay", "Decay", false, { 410, 56, 100, 132 }, "How long the strings ring.");
-        addKnob (pg, "bright", "Bright", false, { 520, 56, 100, 132 }, "String brightness.");
-        addKnob (pg, "harpDrive", "Harp drive", false, { 630, 56, 100, 132 }, "Overdrive inside the strings.");
+        addChoice (pg, "key", "Key", { 6, 80, 104, 44 }, "Key of your song - set it like in your Auto-Tune. The harp, the forest's "
+                                                      "Tune, the Tuned flanger and the melodic distortion (Sing / Dirt) follow it.");
+        addChoice (pg, "chord", "Chord", { 118, 80, 124, 44 }, "Which notes the strings are tuned to - and which overtones count as "
+                                                            "chord tones for Sing / Dirt (Minor = the cleanest, Min7 / Min9 = richer).");
+        addChoice (pg, "register", "Register", { 250, 80, 100, 44 }, "Octave of the harp.");
+        addKnob (pg, "detune", "Detune", false, { 358, 56, 96, 132 },
+                 "Tuning of everything that plays in key, like Detune in Auto-Tune: if your beat is tuned to A = 447 Hz, "
+                 "set 447 Hz (+27.3 cents) and the harp, the forest, the Tuned flanger and the melodic distortion move with it. "
+                 "Right-click to type it exactly (447, 447 Hz, 432.5 or +27.3 ct); Shift-drag for a fine turn; "
+                 "double-click for 440. Presets never change it (nor Key and Chord).");
+        addKnob (pg, "decay", "Decay", false, { 462, 56, 96, 132 }, "How long the strings ring.");
+        addKnob (pg, "bright", "Bright", false, { 560, 56, 96, 132 }, "String brightness.");
+        addKnob (pg, "harpDrive", "Harp drive", false, { 658, 56, 96, 132 }, "Overdrive inside the strings.");
     }
     {
         auto& pg = pages[3];
@@ -2580,6 +2659,7 @@ void MavkaAudioProcessorEditor::timerCallback()
         const int chord = juce::jlimit (0, 11, (int) proc.apvts.getRawParameterValue ("chord")->load());
         const float mix = proc.apvts.getRawParameterValue ("mix")->load(), drive = proc.apvts.getRawParameterValue ("drive")->load();
         const float polish = juce::jmax (mavka::smoothstep (0.5f, 0.1f, mix), mavka::smoothstep (0.35f, 0.05f, drive));
+        overtoneMap.a4 = mavka::detuneToA4 (proc.apvts.getRawParameterValue ("detune")->load());
         overtoneMap.setView (ov, juce::String (mavka::kKeyChoices[key]) + " " + juce::String (mavka::kChordChoices[chord]).toLowerCase(),
                              polish);
     }

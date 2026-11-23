@@ -2,7 +2,7 @@
 //   mavka_test list
 //   mavka_test render <in.wav> <out.wav> <preset> [--bpm 95] [--sr] [--set id=value ...]
 //   mavka_test renderall <in.wav> <outdir> [--bpm 95]
-//   mavka_test latency | alias | stress | cpu | switch | duck | crush | flange | melodic | reverbsafe
+//   mavka_test latency | alias | stress | cpu | switch | duck | crush | flange | melodic | reverbsafe | tuning
 #include "MavkaEngine.h"
 
 #include <algorithm>
@@ -725,6 +725,68 @@ static int testReverbSafe()
     return ok ? 0 : 1;
 }
 
+static int testTuning()
+{
+    // a beat tuned to A = 447 Hz (+27.3 cents): with Detune set to it, everything that plays in key moves along
+    const double sr = 48000.0, cents = a4ToDetune (447.0f), k = std::pow (2.0, cents / 1200.0);
+    bool ok = true;
+
+    // 1. the Tuned flanger rings on the beat's C3 harmonics, not on the 440 Hz ones: where are its comb peaks?
+    auto peakCents = [&] (float detune)
+    {
+        Engine e; e.prepare (sr, 1);
+        float v[P_COUNT]; linearParams (v);
+        v[P_FLANGE] = 1.0f; v[P_FLANGEMODE] = 0.0f; v[P_FLANGEFB] = 0.85f; v[P_KEY] = 0.0f; v[P_CHORD] = 3.0f;
+        v[P_REGISTER] = 1.0f; v[P_OS] = 2.0f; v[P_DETUNE] = detune;
+        e.setParams (v);
+        const size_t n = (size_t) (sr * 1.2);
+        std::mt19937 rng (5); std::normal_distribution<float> G (0.0f, 0.05f);
+        std::vector<std::vector<float>> io (1, std::vector<float> (n));
+        for (auto& x : io[0]) x = G (rng);
+        runEngine (e, io, sr, 120.0);   // beat 1 (0 .. 0.5 s at 120 bpm) rings on the root
+        const size_t N = 32768, start = (size_t) (0.02 * sr) + (size_t) e.getLatency();
+        std::vector<double> w (N, 0.0);
+        const size_t len = (size_t) (0.45 * sr);
+        for (size_t i = 0; i < len; ++i) w[i] = io[0][start + i] * (0.5 - 0.5 * std::cos (2 * kPiD * i / (len - 1)));
+        std::vector<double> mag; fftMag (w, mag);
+        double acc = 0; int cnt = 0;
+        for (int h = 6; h <= 14; ++h)   // where each comb peak sits, against the 440 Hz C3 harmonic (power-weighted)
+        {
+            const double f = 130.8128 * h;
+            const int lo = (int) (f * 0.97 / sr * N), hi = (int) (f * 1.03 / sr * N);
+            double sw = 0, sf = 0;
+            for (int q = lo; q <= hi; ++q) { const double m = mag[(size_t) q] * mag[(size_t) q]; sw += m; sf += m * q; }
+            acc += 1200.0 * std::log2 ((sf / sw) * sr / N / f); ++cnt;
+        }
+        return acc / cnt;
+    };
+    const double at440 = peakCents (0.0f), at447 = peakCents ((float) cents);
+    std::printf ("TUNING: Detune %+.1f cents (A = 447 Hz): the Tuned flanger's peaks move from %+.1f to %+.1f cents\n",
+                 cents, at440, at447);
+    ok = ok && std::fabs ((at447 - at440) - cents) < 8.0;
+
+    // 2. a sample tuned 45 cents sharp: with Detune left at 440 the melodic distortion mistakes its chord tones for
+    //    dirt; with Detune set to the sample, it hears them right again
+    const double sharp = 45.0, ks = std::pow (2.0, sharp / 1200.0);
+    double drop[2] = {}, keepE[2] = {};
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        float v[P_COUNT]; linearParams (v);
+        v[P_CLIP] = 0.9f; v[P_GRIT] = 0.6f; v[P_SHOULDER] = 0.64f; v[P_DRIVE] = 0.3f; v[P_KEY] = 9.0f; v[P_CHORD] = 3.0f; v[P_OS] = 3.0f;
+        v[P_DETUNE] = pass == 1 ? (float) sharp : 0.0f;
+        const ToneLevels plain = measureTone (v, 1, 220.0 * ks, 0.3);
+        v[P_SING] = 1.2f; v[P_DIRT] = 0.0f;
+        const ToneLevels mel = measureTone (v, 1, 220.0 * ks, 0.3);
+        drop[pass] = plain.lv[0][10] - mel.lv[0][10];
+        keepE[pass] = mel.lv[0][6] - plain.lv[0][6];
+    }
+    std::printf ("  A3 sung 45 cents sharp: Detune at 440 -> E (a chord tone) %+.1f dB, C# %.1f dB lower; "
+                 "Detune +45 -> E %+.1f dB, C# %.1f dB lower\n", keepE[0], drop[0], keepE[1], drop[1]);
+    ok = ok && keepE[0] < -6.0 && keepE[1] > 0.5 && drop[1] > 30.0;
+    std::printf (ok ? "TUNING: OK (harp, flanger and the melodic distortion follow the beat's tuning)\n" : "TUNING: CHECK\n");
+    return ok ? 0 : 1;
+}
+
 static int testFlange()
 {
     // Tuned mode: white noise through the flanger must ring on the chord tone of the current beat
@@ -901,6 +963,7 @@ int main (int argc, char** argv)
     if (cmd == "flange")  return testFlange();
     if (cmd == "melodic" || cmd == "clipkey") return testMelodic();
     if (cmd == "reverbsafe") return testReverbSafe();
+    if (cmd == "tuning") return testTuning();
     double bpm = 95.0; std::vector<std::string> sets;
     std::vector<std::string> pos;
     for (int i = 2; i < argc; ++i)

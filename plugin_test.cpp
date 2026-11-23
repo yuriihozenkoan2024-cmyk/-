@@ -84,7 +84,7 @@ int main (int argc, char** argv)
         bool ok = true;
         for (int k = 0; k < mavka::P_COUNT; ++k)
         {
-            if (k == mavka::P_OS || k == mavka::P_OUTPUT) continue;
+            if (mavka::presetKeeps (k)) continue;
             const float v = p.apvts.getRawParameterValue (mavka::paramDefs()[k].id)->load();
             if (std::abs (v - expected[k]) > 1.0e-3f * (1.0f + std::abs (expected[k]))) ok = false;
         }
@@ -144,6 +144,23 @@ int main (int argc, char** argv)
         check (sing->getText (sing->getDefaultValue(), 32) == "120%", "Sing defaults to 120%");
         auto* ot5 = p.apvts.getParameter ("ot5");
         check (std::abs (ot5->convertFrom0to1 (ot5->getValueForText ("+6.0 dB")) - 6.0f) < 0.05f, "overtone gains parse dB");
+        // Detune: the tuning reference, typed in Hz or cents
+        auto* det = p.apvts.getParameter ("detune");
+        check (det->getText (det->getDefaultValue(), 32) == "440.0 Hz", "Detune shows A4 in Hz (440.0 Hz by default)");
+        const float c447 = det->convertFrom0to1 (det->getValueForText ("447"));
+        const float c432 = det->convertFrom0to1 (det->getValueForText ("432.0 Hz"));
+        const float cCt = det->convertFrom0to1 (det->getValueForText ("-12.5 ct"));
+        check (std::abs (c447 - 27.31f) < 0.05f && std::abs (c432 + 31.77f) < 0.05f && std::abs (cCt + 12.5f) < 0.05f,
+               "Detune accepts 447 / 432.0 Hz / -12.5 ct");
+        check (det->getText (det->convertTo0to1 (c447), 32) == "447.0 Hz", "Detune shows 447.0 Hz back");
+        // a preset load keeps the song: key, chord and tuning
+        p.apvts.getParameter ("key")->setValueNotifyingHost (p.apvts.getParameter ("key")->convertTo0to1 (9.0f));
+        det->setValueNotifyingHost (det->convertTo0to1 (c447));
+        p.loadFactoryPreset (3);
+        check (std::abs (p.apvts.getRawParameterValue ("key")->load() - 9.0f) < 1.0e-3f
+               && std::abs (p.apvts.getRawParameterValue ("detune")->load() - c447) < 0.05f, "presets keep the song's key and tuning");
+        det->setValueNotifyingHost (det->getDefaultValue());
+        p.apvts.getParameter ("key")->setValueNotifyingHost (0.0f);
     }
 
     // text <-> value

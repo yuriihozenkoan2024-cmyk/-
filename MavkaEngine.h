@@ -734,7 +734,8 @@ private:
 
     // cached settings
     float lastLowCut = -1.0f, lastHighCut = -1.0f, lastTilt = 1.0e9f, lastTone = 1.0e9f;
-    float lastDecay = -1.0f, lastBright = -1.0f, lastHarpDrive = -1.0f, lastWidth = -1.0f;
+    float lastDecay = -1.0f, lastBright = -1.0f, lastHarpDrive = -1.0f, lastWidth = -1.0f, lastDetune = -1.0e9f;
+    float tuneSemis = 0.0f;   // Detune in semitones (the tuning reference of everything that plays in key)
     int lastKey = -1, lastChord = -1, lastReg = -1;
     float chordPc[6] {};   // pitch classes of the song's chord (0 = C), for the melodic distortion
     int numChordPc = 1;
@@ -934,6 +935,7 @@ inline void Engine::prepare (double sampleRate, int /*numChannels*/)
     lastLowCut = lastHighCut = -1.0f;
     lastTilt = lastTone = 1.0e9f;
     lastDecay = lastBright = lastHarpDrive = lastWidth = -1.0f;
+    lastDetune = -1.0e9f;
     lastKey = lastChord = lastReg = -1;
     reset();
 }
@@ -1120,8 +1122,11 @@ inline void Engine::updateBlock() noexcept
     const int chord = std::min (std::max ((int) (v[P_CHORD] + 0.5f), 0), 11);
     const int reg = std::min (std::max ((int) (v[P_REGISTER] + 0.5f), 0), 2);
     if (key != lastKey || chord != lastChord || reg != lastReg || differs (v[P_WIDTH], lastWidth)
-        || differs (v[P_DECAY], lastDecay) || differs (v[P_BRIGHT], lastBright) || differs (v[P_HARPDRIVE], lastHarpDrive))
+        || differs (v[P_DECAY], lastDecay) || differs (v[P_BRIGHT], lastBright) || differs (v[P_HARPDRIVE], lastHarpDrive)
+        || differs (v[P_DETUNE], lastDetune))
     {
+        // Detune: the whole key grid (strings, forest, tuned flanger, the melodic distortion) moves with the beat's tuning
+        tuneSemis = clampf (v[P_DETUNE], -100.0f, 100.0f) * 0.01f;
         const int root = 36 + 12 * reg + key;
         numChordPc = 0;
         for (int i = 0; i < Harp::kStrings; ++i)
@@ -1141,7 +1146,7 @@ inline void Engine::updateBlock() noexcept
                 float cents = tables::kStringDetune[i];
                 if (chord == 0 && i >= 3) cents += 4.0f;
                 if (c == 1) cents += 5.0f * v[P_WIDTH];
-                const float midi = (float) (root + tables::kChords[chord][i]) + 0.01f * cents;
+                const float midi = (float) (root + tables::kChords[chord][i]) + 0.01f * cents + tuneSemis;
                 hz[i] = 440.0f * std::exp2 ((midi - 69.0f) / 12.0f);
             }
             ch[c].harp.configure (hz, v[P_DECAY], v[P_BRIGHT], v[P_HARPDRIVE]);
@@ -1161,7 +1166,7 @@ inline void Engine::updateBlock() noexcept
         }
         ++harpVersion;
         lastKey = key; lastChord = chord; lastReg = reg; lastWidth = v[P_WIDTH];
-        lastDecay = v[P_DECAY]; lastBright = v[P_BRIGHT]; lastHarpDrive = v[P_HARPDRIVE];
+        lastDecay = v[P_DECAY]; lastBright = v[P_BRIGHT]; lastHarpDrive = v[P_HARPDRIVE]; lastDetune = v[P_DETUNE];
     }
 
     const int ftype = std::min (std::max ((int) (v[P_FORESTTYPE] + 0.5f), 0), 3);
@@ -1539,7 +1544,7 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
                 {
                     C.fitF0 = C.noteSemi;
                     C.fitVersion = harpVersion;
-                    const float pcVoice = C.noteSemi;   // the sung note, semitones above C4
+                    const float pcVoice = C.noteSemi - tuneSemis;   // the sung note, semitones above C4 (on the beat's tuning)
                     for (int h = 0; h < kBands; ++h)
                     {
                         C.fitOk[h] = inkey::kMult[h] * C.f0 > inkey::kTopHz ? 0.0f : 1.0f;
