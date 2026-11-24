@@ -817,6 +817,7 @@ public:
         hostPlaying = isPlaying;
         if (bpm > 1.0 && bpm < 2000.0)
             hostBpm = bpm;
+        guiBpm.store ((float) hostBpm, std::memory_order_relaxed);
         hostPpq = ppqAtBlockStart;
         blockPos = 0;
     }
@@ -833,6 +834,21 @@ public:
     float getDuckGain (int band) const noexcept { return guiDuck[std::min (std::max (band, 0), DuckBands::kBands - 1)].load (std::memory_order_relaxed); }
     // how hard the Pressure clip bites (0..2), peak since the GUI last asked
     float takeClipHit() noexcept                { return guiClip.exchange (0.0f, std::memory_order_relaxed); }
+
+    // LIGATURE tab (while it is on screen): the voice, what of it goes into the echo, the echo, and how open the
+    // echo is (1 = it plays freely, 0 = pressed under the voice) since the last look
+    struct LigatureMeter { float voice = 0.0f, fed = 0.0f, echo = 0.0f, open = 1.0f; };
+    void setLigatureMetering (bool b) noexcept { ligMetering.store (b, std::memory_order_relaxed); }
+    LigatureMeter takeLigature() noexcept
+    {
+        LigatureMeter m;
+        m.voice = guiLigVoice.exchange (0.0f, std::memory_order_relaxed);
+        m.fed = guiLigFed.exchange (0.0f, std::memory_order_relaxed);
+        m.echo = guiLigEcho.exchange (0.0f, std::memory_order_relaxed);
+        m.open = guiLigOpen.load (std::memory_order_relaxed);
+        return m;
+    }
+    float getHostBpm() const noexcept { return guiBpm.load (std::memory_order_relaxed); }
 
     // MELODIC DISTORTION, for the overtone map: what the core adds at every overtone of the voice right now
     struct OvertoneView
@@ -1081,6 +1097,8 @@ private:
     std::atomic<float> guiDuck[DuckBands::kBands];
     std::atomic<float> guiInk { 0.0f }, guiVoiced { 1.0f }, guiSlant { 0.0f }, guiLevel { -100.0f }, guiRel { -60.0f };
     std::atomic<float> guiClip { 0.0f };
+    std::atomic<float> guiLigVoice { 0.0f }, guiLigFed { 0.0f }, guiLigEcho { 0.0f }, guiLigOpen { 1.0f }, guiBpm { 120.0f };
+    std::atomic<bool> ligMetering { false };
     std::atomic<float> guiF0 { 0.0f }, guiConf { 0.0f }, guiPush { 0.0f };
     std::atomic<float> guiOtLevel[InnerControls::kBands], guiOtGain[InnerControls::kBands], guiOtFit[InnerControls::kBands];
     std::atomic<bool> guiHalves { false }, guiPlain { false };
@@ -2174,6 +2192,8 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
     guiImgOnD.store (imgDbl.on, std::memory_order_relaxed);
     guiImgOnL.store (imgLig.on, std::memory_order_relaxed);
     const int imgMeter = imgMetering.load (std::memory_order_relaxed);   // -1 none, 0 Ligature, 1 doubles
+    const bool ligMeter = ligMetering.load (std::memory_order_relaxed);
+    float lmVoice = 0.0f, lmFed = 0.0f, lmEcho = 0.0f, lmOpen = 0.0f;
     int imgW = imgPos.load (std::memory_order_relaxed);
 
     float check = 0.0f;
@@ -2247,6 +2267,22 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
         if (imgMeter == 1) { mPost[0] = wv[0]; mPost[1] = stereo ? wv[1] : wv[0]; }
 
         // Ligature: saturated ping-pong echo in time with the song, ducked while the voice sings
+        if (ligMeter)
+        {
+            const float vo = std::fabs (stereo ? 0.5f * (dryOut[0][j] + dryOut[1][j]) : dryOut[0][j]);
+            lmVoice = std::max (lmVoice, vo);
+            lmFed = std::max (lmFed, vo * (ligOn ? ctlLigDoor.tap (dly) : 0.0f));
+            float g = 1.0f;
+            if (ligOn && duckMode == 1)
+                g = 1.0f - ligGate * (1.0f - ligClassic);
+            else if (ligOn && spectral)
+            {
+                g = 0.0f;
+                for (int b = 0; b < DuckBands::kBands; ++b) g += duckLig.gain[b];
+                g *= 1.0f / (float) DuckBands::kBands;
+            }
+            lmOpen += g;
+        }
         if (ligOn)
         {
             ligTL += (ligTLt - ligTL) * aLigT;
@@ -2281,6 +2317,7 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
                     imgLig.settle();
                 }
                 if (imgMeter == 0) { mPost[0] = rL; mPost[1] = rR; }
+                if (ligMeter) lmEcho = std::max (lmEcho, std::max (std::fabs (rL), std::fabs (rR)));
                 wv[0] += rL;
                 wv[1] += rR;
             }
@@ -2290,6 +2327,7 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
                 ligL.push (wv[0] * inDoor + ligFb * f);
                 wv[0] += rL;
                 if (imgMeter == 0) { mPre[0] = mPre[1] = mPost[0] = mPost[1] = rL; }
+                if (ligMeter) lmEcho = std::max (lmEcho, std::fabs (rL));
             }
         }
 
@@ -2426,6 +2464,13 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
         imgPos.store (imgW, std::memory_order_release);
     if (clipPeak > guiClip.load (std::memory_order_relaxed))
         guiClip.store (clipPeak, std::memory_order_relaxed);
+    if (ligMeter)
+    {
+        if (lmVoice > guiLigVoice.load (std::memory_order_relaxed)) guiLigVoice.store (lmVoice, std::memory_order_relaxed);
+        if (lmFed > guiLigFed.load (std::memory_order_relaxed)) guiLigFed.store (lmFed, std::memory_order_relaxed);
+        if (lmEcho > guiLigEcho.load (std::memory_order_relaxed)) guiLigEcho.store (lmEcho, std::memory_order_relaxed);
+        guiLigOpen.store (lmOpen / (float) std::max (1, n), std::memory_order_relaxed);
+    }
 
     for (int b = 0; b < DuckBands::kBands; ++b)
     {

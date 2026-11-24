@@ -2493,6 +2493,146 @@ void ImagerField::mouseDoubleClick (const juce::MouseEvent& e)
     repaint();
 }
 
+
+//==============================================================================
+float LigatureView::value (const char* id) const
+{
+    if (auto* v = apvts.getRawParameterValue (id)) return v->load();
+    return 0.0f;
+}
+
+void LigatureView::push (float voiceLevel, float fedLevel, float echoLevel, float openness, float hostBpm)
+{
+    auto norm = [] (float x) { return juce::jlimit (0.0f, 1.0f, (20.0f * std::log10 (std::max (x, 1.0e-6f)) + 54.0f) / 54.0f); };
+    head = (head + 1) % N;
+    voice[(size_t) head] = norm (voiceLevel);
+    fed[(size_t) head] = norm (fedLevel);
+    echo[(size_t) head] = norm (echoLevel * 2.0f);   // the echo sits well under the voice: show it a little larger
+    open[(size_t) head] = juce::jlimit (0.0f, 1.0f, openness);
+    if (hostBpm > 1.0f) bpm = hostBpm;
+    repaint();
+}
+
+void LigatureView::paint (juce::Graphics& g)
+{
+    const auto r = getLocalBounds().toFloat();
+    recess (g, r);
+    const bool on = value ("ligature") > 0.0005f;
+
+    // ---- left: when it opens (live)
+    auto live = r.withWidth (r.getWidth() * 0.58f).reduced (6.0f, 4.0f);
+    {
+        const auto hdr = live.removeFromTop (10.0f);
+        g.setFont (sans (8.5f, true, 0.12f));
+        g.setColour (theme::inkFaint);
+        g.drawText ("WHEN IT OPENS", hdr, juce::Justification::topLeft, false);
+        g.setFont (sans (8.0f, false, 0.04f));
+        g.drawText (on ? u8 ("voice \xe2\x86\x91  echo \xe2\x86\x93") : juce::String ("Ligature is at 0"), hdr, juce::Justification::topRight, false);
+    }
+    const auto door = live.removeFromTop (7.0f);
+    live.removeFromTop (2.0f);
+    const float w = live.getWidth() / (float) (N - 1);
+    // the voice grows up from the middle line, the echo hangs down from it: the echo blooms where the voice stops
+    const float mid = live.getY() + live.getHeight() * 0.55f;
+    auto silhouette = [&] (const std::array<float, N>& a, juce::Colour c, float reach)
+    {
+        juce::Path p;
+        p.startNewSubPath (live.getX(), mid);
+        for (int i = 0; i < N; ++i)
+        {
+            const float v = a[(size_t) ((head + 1 + i) % N)];
+            p.lineTo (live.getX() + (float) i * w, mid - v * reach);
+        }
+        p.lineTo (live.getRight(), mid);
+        p.closeSubPath();
+        g.setColour (c);
+        g.fillPath (p);
+    };
+    silhouette (voice, theme::ink.withAlpha (0.18f), mid - live.getY());            // the voice
+    silhouette (fed, theme::ink.withAlpha (0.5f), mid - live.getY());               // what of it goes into the echo (Attack / Open)
+    if (on)
+    {
+        // the echo itself, hanging down: deep red where it is open and plays, pale where the voice holds it down
+        const float reach = live.getBottom() - mid;
+        for (int i = 0; i < N; ++i)
+        {
+            const size_t k = (size_t) ((head + 1 + i) % N);
+            const float hgt = echo[k] * reach;
+            if (hgt < 0.3f)
+                continue;
+            g.setColour (theme::blood.withAlpha (0.18f + 0.72f * open[k]));
+            g.fillRect (juce::Rectangle<float> (live.getX() + (float) i * w - 0.5f * w, mid, w + 0.4f, hgt));
+        }
+    }
+    // along the top: how open the echo is right now (Duck / Soft / Return)
+    for (int i = 0; i < N - 1; ++i)
+    {
+        const float o = on ? open[(size_t) ((head + 1 + i) % N)] : 0.0f;
+        g.setColour (theme::blood.withAlpha (0.04f + 0.86f * o * o));
+        g.fillRect (juce::Rectangle<float> (door.getX() + (float) i * w, door.getY(), w + 0.6f, door.getHeight()));
+    }
+    g.setColour (theme::hair.withAlpha (0.8f));
+    g.drawLine (live.getX(), mid, live.getRight(), mid, 0.6f);
+
+    // ---- right: where the repeats fall (left side up, right side down)
+    auto taps = r.withTrimmedLeft (r.getWidth() * 0.58f).reduced (6.0f, 4.0f);
+    g.setFont (sans (8.5f, true, 0.12f));
+    g.setColour (theme::inkFaint);
+    g.drawText ("TAPS", taps.removeFromTop (10.0f), juce::Justification::topLeft, false);
+    static const float kBeats[12] = { 0.0f, 0.125f, 1.0f / 6.0f, 0.25f, 0.375f, 1.0f / 3.0f, 0.5f, 0.75f, 2.0f / 3.0f, 1.0f, 1.5f, 2.0f };
+    static const char* const kNames[12] = { "Free", "1/32", "1/16T", "1/16", "1/16.", "1/8T", "1/8", "1/8.", "1/4T", "1/4", "1/4.", "1/2" };
+    auto sideMs = [&] (const char* sync, const char* ms, juce::String& name)
+    {
+        const int s = juce::jlimit (0, 11, (int) (value (sync) + 0.5f));
+        name = kNames[s];
+        return std::min (1500.0f, s == 0 ? value (ms) : kBeats[s] * 60000.0f / bpm);
+    };
+    juce::String nl, nr;
+    const float tl = std::max (1.0f, sideMs ("ligLeft", "ligLeftMs", nl)), tr = std::max (1.0f, sideMs ("ligRight", "ligRightMs", nr));
+    const float lig = value ("ligature"), rep = value ("ligRepeats");
+    const float base = 0.2f + 0.5f * lig;
+    const float fb = rep > 0.0f ? base + rep * (0.97f - base) : base + rep * base;
+    const float span = juce::jlimit (600.0f, 4000.0f, 2.6f * (tl + tr));
+    const float axis = taps.getCentreY() + 3.0f, half = taps.getHeight() * 0.5f - 4.0f;
+    g.setColour (theme::hair.withAlpha (0.7f));
+    g.drawLine (taps.getX(), axis, taps.getRight(), axis, 0.7f);
+    // the word itself, at 0
+    g.setColour (theme::ink.withAlpha (0.55f));
+    g.fillRect (juce::Rectangle<float> (taps.getX(), axis - 3.0f, 3.0f, 6.0f));
+    const float drive = value ("ligDrive");
+    const float thick = 1.3f + 1.4f * juce::jlimit (0.0f, 1.0f, (drive + 12.0f) / 30.0f);
+    const float tone = value ("ligTone");
+    for (int side = 0; side < 2; ++side)
+    {
+        // a side's repeats: its own time, then every crossing adds the other side's time
+        const float t0 = side == 0 ? tl : tr, t1 = side == 0 ? tr : tl;
+        float t = t0, gain = 1.0f;
+        for (int k = 0; k < 24 && t < span; ++k)
+        {
+            const float x = taps.getX() + t / span * taps.getWidth();
+            const float h = half * std::sqrt (std::max (0.0f, gain)) * (on ? 1.0f : 0.25f);
+            // later repeats grow darker / thinner with Dark, keep their edge with Bright
+            const float fade = std::pow (0.82f + 0.12f * tone, (float) k);
+            g.setColour (theme::ink.withAlpha ((on ? 0.85f : 0.3f) * juce::jlimit (0.2f, 1.0f, fade)));
+            g.fillRect (juce::Rectangle<float> (x - thick * 0.5f, side == 0 ? axis - h : axis, thick, h));
+            t += (k % 2 == 0) ? t1 : t0;
+            gain *= fb;
+            if (gain < 0.003f) break;
+        }
+    }
+    g.setFont (numbers (8.5f));
+    g.setColour (theme::inkSoft);
+    auto label = [] (const juce::String& name, float ms)
+    {
+        const juce::String t = juce::String (juce::roundToInt (ms)) + " ms";
+        return name == "Free" ? t : name + "  " + t;
+    };
+    g.drawText ("L " + label (nl, tl), juce::Rectangle<float> (taps.getX() + 6.0f, taps.getY(), taps.getWidth() - 6.0f, 10.0f),
+                juce::Justification::topRight, false);
+    g.drawText ("R " + label (nr, tr), juce::Rectangle<float> (taps.getX() + 6.0f, taps.getBottom() - 10.0f, taps.getWidth() - 6.0f, 10.0f),
+                juce::Justification::bottomRight, false);
+}
+
 //==============================================================================
 void Page::paint (juce::Graphics& g)
 {
@@ -2897,11 +3037,13 @@ MavkaAudioProcessorEditor::MavkaAudioProcessorEditor (MavkaAudioProcessor& p)
                                       "the first syllables. 4 ms = as before.");
         knob (122, "ligReturn", "Return", "How fast the echo comes back once you stop: short = it jumps into every little pause, "
                                           "long = it swells in slowly. 140 ms = as before.");
-        pg.notes = u8 ("LIGATURE\n"
-                       "speaks in the pauses, joins the words\n"
-                       "duck mode, depth, feed \xe2\x86\x92 AURA \xc2\xb7 DUCK\n"
-                       "its width by band \xe2\x86\x92 the IMAGER tab");
-        pg.notesArea = { 410, 130, 340, 80 };
+        ligView.setBounds (400, 122, 352, 82);
+        ligView.setTooltip ("When the echo opens. Left, live: your voice in grey ink, what of it goes into the echo in dark ink "
+                            "(Attack / Open), the echo in blood, and along the top how open it is right now - dark red = it "
+                            "plays, pale = your voice presses it down (Duck / Soft / Return; the mode is in AURA - DUCK). "
+                            "Right: where the repeats fall with these settings - left side up, right side down, each as loud "
+                            "as Repeats leaves it. Its width by band: the IMAGER tab.");
+        pg.addAndMakeVisible (ligView);
     }
     {
         // IMAGER: two of them - the Ligature echo's and the doubles' - each with its own four bands
@@ -3099,7 +3241,8 @@ MavkaAudioProcessorEditor::~MavkaAudioProcessorEditor()
 {
     stopTimer();
     proc.engine.setMetering (false);
-    proc.engine.setImagerMetering (false);
+    proc.engine.setImagerMetering (-1);
+    proc.engine.setLigatureMetering (false);
     texCancel = true;
     if (texJob.joinable())
         texJob.join();
@@ -3212,6 +3355,7 @@ void MavkaAudioProcessorEditor::showPage (int index)
     currentPage = index;
     proc.engine.setMetering (index == 5);   // the overtone map and the scope cost a little: only while they are seen
     proc.engine.setImagerMetering (index == 7 ? imagerWhich : -1);
+    proc.engine.setLigatureMetering (index == 6);
 }
 
 void MavkaAudioProcessorEditor::pickImager (int which)
@@ -3293,6 +3437,11 @@ void MavkaAudioProcessorEditor::timerCallback()
                              polish);
     }
 
+    if (currentPage == 6)
+    {
+        const auto m = e.takeLigature();
+        ligView.push (m.voice, m.fed, m.echo, m.open, e.getHostBpm());
+    }
     if (currentPage == 7)
     {
         const int n = mavka::Engine::kImg;

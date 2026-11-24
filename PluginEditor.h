@@ -305,6 +305,25 @@ private:
     float dragFrom = 0.0f, dragX = 0.0f, dragY = 0.0f;
 };
 
+// LIGATURE tab: when the echo opens - a live strip (the voice in grey ink, what of it goes into the echo in dark
+// ink, the echo itself in blood, and along the top how open the echo is) - and where its repeats fall: the
+// ping-pong taps of the current settings, left side up, right side down, each one as loud as the repeats leave it
+class LigatureView final : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+    explicit LigatureView (juce::AudioProcessorValueTreeState& state) : apvts (state) {}
+    static constexpr int N = 100;   // ~3.3 s at 30 looks a second
+    void push (float voiceLevel, float fedLevel, float echoLevel, float openness, float hostBpm);
+    void paint (juce::Graphics&) override;
+
+private:
+    float value (const char* id) const;
+    juce::AudioProcessorValueTreeState& apvts;
+    std::array<float, N> voice {}, fed {}, echo {}, open {};
+    int head = 0;
+    float bpm = 120.0f;
+};
+
 struct Page final : public juce::Component
 {
     juce::String description, notes;   // notes: a few printed lines (one per line) inside notesArea
@@ -392,6 +411,7 @@ private:
     mavkaui::ClipScope clipScope;
     mavkaui::OvertoneMap overtoneMap { proc.apvts };
     mavkaui::ImagerField imagerField { proc.apvts };
+    mavkaui::LigatureView ligView { proc.apvts };
     int imagerWhich = 0;                       // the IMAGER tab shows the Ligature's (0) or the doubles' (1) imager
     juce::TextButton imgPick[2];
     std::vector<mavkaui::Knob*> imgKnobs[2];

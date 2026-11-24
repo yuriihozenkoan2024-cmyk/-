@@ -270,8 +270,10 @@ int main (int argc, char** argv)
         juce::MidiBuffer midi;
         editor.selectPage (5);   // the CLIP tab meters the core while the audio runs
         const int ticks = 205;   // ~6.8 s: the rap section
-        for (int t = 0; t < ticks + 60; ++t)
+        for (int t = 0; t < ticks + 120; ++t)
         {
+            if (t == ticks + 60)
+                editor.selectPage (6);   // then the LIGATURE tab watches when the echo opens
             if (t == ticks)
             {
                 // then the doubles and the imager at work, with the IMAGER tab open
@@ -335,7 +337,7 @@ int main (int argc, char** argv)
                 for (int c = 0; c < 2; ++c)
                     for (int i = 0; i < 1600; ++i)
                     {
-                        const int idx = (ticks + 60 + t) * 1600 + i;
+                        const int idx = (ticks + 120 + t) * 1600 + i;
                         buf.setSample (c, i, voice.getNumSamples() > idx ? voice.getSample (juce::jmin (c, voice.getNumChannels() - 1), idx)
                                                                          : 0.1f * (float) std::sin (idx * 0.02));
                     }
