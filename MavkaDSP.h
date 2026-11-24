@@ -157,6 +157,7 @@ public:
     }
 
     void reset() noexcept { std::fill (buf.begin(), buf.end(), 0.0f); w = 0; }
+    void fill (float v) noexcept { std::fill (buf.begin(), buf.end(), v); }   // a control line that starts at v
 
     inline void push (float x) noexcept { w = (w + 1) & mask; buf[(size_t) w] = x; }
     inline float tap (int d) const noexcept { return buf[(size_t) ((w - d) & mask)]; }

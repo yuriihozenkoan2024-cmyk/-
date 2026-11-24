@@ -36,6 +36,7 @@ static const char* const kForestChoices[]   = { "Room", "Plate", "Hall", "Cathed
 static const char* const kTwinChoices[]     = { "Tight", "Wide", "Lush", "Choir", "Octave" };
 static const char* const kDuckChoices[]     = { "Spectral", "Classic", "Off" };
 static const char* const kSyncChoices[]     = { "Free", "1/64", "1/32", "1/16T", "1/16", "1/8T", "1/8" };
+static const char* const kLigSyncChoices[]  = { "Free", "1/32", "1/16T", "1/16", "1/16.", "1/8T", "1/8", "1/8.", "1/4T", "1/4", "1/4.", "1/2" };
 static const char* const kCrushChoices[]    = { "Harmonic", "Digital", "Clock" };
 static const char* const kFlangeChoices[]   = { "Tuned", "Jet", "Stroke" };
 
@@ -72,8 +73,13 @@ enum ParamIndex
     // THE DOUBLES, finely (Glass: its Throw is the Doppler knob; Fold gets its own)
     P_GTIME, P_GSYNC, P_GREPEATS, P_GFLOAT, P_GRATE, P_GTONE, P_GDRIVE, P_GATTACK, P_GOPEN,
     P_FTIME, P_FSYNC, P_FREPEATS, P_FTHROW, P_FFLOAT, P_FRATE, P_FTONE, P_FDRIVE, P_FATTACK, P_FOPEN,
-    // IMAGER: the width of the wet sound in four bands
+    // IMAGER for the doubles (MAVKA's own sound, before the Ligature joins it): the width in four bands
     P_IX1, P_IX2, P_IX3, P_IW1, P_IW2, P_IW3, P_IW4, P_IS1, P_IS2, P_IS3, P_IS4, P_IRECOVER,
+    // LIGATURE, finely: the time of each side, repeats, tone, drive, float, and how it opens on the words
+    P_LLEFT, P_LLEFTMS, P_LRIGHT, P_LRIGHTMS, P_LREPEATS, P_LTONE, P_LDRIVE, P_LFLOAT, P_LRATE,
+    P_LATTACK, P_LOPEN, P_LDUCK, P_LSOFT, P_LRETURN,
+    // IMAGER for the Ligature echo (the same twelve as the doubles' imager above)
+    P_LIX1, P_LIX2, P_LIX3, P_LIW1, P_LIW2, P_LIW3, P_LIW4, P_LIS1, P_LIS2, P_LIS3, P_LIS4, P_LIRECOVER,
     P_COUNT
 };
 
@@ -189,18 +195,46 @@ inline const ParamDef* paramDefs() noexcept
         { "foldDrive",   "Fold Drive",    PType::Float, -12.0f, 12.0f, 0.0f,  0.0f,  Unit::Db,     nullptr, 0 },
         { "foldAttack",  "Fold Attack",   PType::Float, -1.0f, 1.0f,   0.0f,  0.0f,  Unit::Door,   nullptr, 0 },
         { "foldOpen",    "Fold Open",     PType::Float,  5.0f, 600.0f, 120.0f, 100.0f, Unit::Ms,   nullptr, 0 },
-        { "imgX1",       "Imager X1",     PType::Float,  40.0f, 1000.0f, 180.0f, 180.0f, Unit::Hz, nullptr, 0 },
-        { "imgX2",       "Imager X2",     PType::Float,  300.0f, 6000.0f, 1200.0f, 1200.0f, Unit::Hz, nullptr, 0 },
-        { "imgX3",       "Imager X3",     PType::Float,  1500.0f, 18000.0f, 5500.0f, 5500.0f, Unit::Hz, nullptr, 0 },
-        { "imgW1",       "Imager Width 1",  PType::Float, -1.0f, 1.0f, 0.0f, 0.0f, Unit::Bipolar, nullptr, 0 },
-        { "imgW2",       "Imager Width 2",  PType::Float, -1.0f, 1.0f, 0.0f, 0.0f, Unit::Bipolar, nullptr, 0 },
-        { "imgW3",       "Imager Width 3",  PType::Float, -1.0f, 1.0f, 0.0f, 0.0f, Unit::Bipolar, nullptr, 0 },
-        { "imgW4",       "Imager Width 4",  PType::Float, -1.0f, 1.0f, 0.0f, 0.0f, Unit::Bipolar, nullptr, 0 },
-        { "imgS1",       "Imager Spread 1", PType::Float, 0.0f, 1.0f, 0.0f, 0.0f, Unit::Percent, nullptr, 0 },
-        { "imgS2",       "Imager Spread 2", PType::Float, 0.0f, 1.0f, 0.0f, 0.0f, Unit::Percent, nullptr, 0 },
-        { "imgS3",       "Imager Spread 3", PType::Float, 0.0f, 1.0f, 0.0f, 0.0f, Unit::Percent, nullptr, 0 },
-        { "imgS4",       "Imager Spread 4", PType::Float, 0.0f, 1.0f, 0.0f, 0.0f, Unit::Percent, nullptr, 0 },
-        { "imgRecover",  "Imager Recover",  PType::Float, 0.0f, 1.0f, 0.0f, 0.0f, Unit::Percent, nullptr, 0 },
+        { "imgX1",       "Doubles Imager Split 1",  PType::Float,  40.0f, 1000.0f, 180.0f, 180.0f, Unit::Hz, nullptr, 0 },
+        { "imgX2",       "Doubles Imager Split 2",  PType::Float,  300.0f, 6000.0f, 1200.0f, 1200.0f, Unit::Hz, nullptr, 0 },
+        { "imgX3",       "Doubles Imager Split 3",  PType::Float,  1500.0f, 18000.0f, 5500.0f, 5500.0f, Unit::Hz, nullptr, 0 },
+        { "imgW1",       "Doubles Imager Width Low",      PType::Float, -1.0f, 1.0f, 0.0f, 0.0f, Unit::Bipolar, nullptr, 0 },
+        { "imgW2",       "Doubles Imager Width Low mid",  PType::Float, -1.0f, 1.0f, 0.0f, 0.0f, Unit::Bipolar, nullptr, 0 },
+        { "imgW3",       "Doubles Imager Width High mid", PType::Float, -1.0f, 1.0f, 0.0f, 0.0f, Unit::Bipolar, nullptr, 0 },
+        { "imgW4",       "Doubles Imager Width High",     PType::Float, -1.0f, 1.0f, 0.0f, 0.0f, Unit::Bipolar, nullptr, 0 },
+        { "imgS1",       "Doubles Imager Spread Low",      PType::Float, 0.0f, 1.0f, 0.0f, 0.0f, Unit::Percent, nullptr, 0 },
+        { "imgS2",       "Doubles Imager Spread Low mid",  PType::Float, 0.0f, 1.0f, 0.0f, 0.0f, Unit::Percent, nullptr, 0 },
+        { "imgS3",       "Doubles Imager Spread High mid", PType::Float, 0.0f, 1.0f, 0.0f, 0.0f, Unit::Percent, nullptr, 0 },
+        { "imgS4",       "Doubles Imager Spread High",     PType::Float, 0.0f, 1.0f, 0.0f, 0.0f, Unit::Percent, nullptr, 0 },
+        { "imgRecover",  "Doubles Imager Recover",  PType::Float, 0.0f, 1.0f, 0.0f, 0.0f, Unit::Percent, nullptr, 0 },
+        // LIGATURE (every default = the sound of the earlier versions: 1/8 left, dotted 1/8 right)
+        { "ligLeft",     "Ligature Left",     PType::Choice, 0.0f, 11.0f,  6.0f,   0.0f,   Unit::None,    kLigSyncChoices, 12 },
+        { "ligLeftMs",   "Ligature Left ms",  PType::Float, 10.0f, 1500.0f, 250.0f, 250.0f, Unit::Ms,      nullptr, 0 },
+        { "ligRight",    "Ligature Right",    PType::Choice, 0.0f, 11.0f,  7.0f,   0.0f,   Unit::None,    kLigSyncChoices, 12 },
+        { "ligRightMs",  "Ligature Right ms", PType::Float, 10.0f, 1500.0f, 375.0f, 250.0f, Unit::Ms,      nullptr, 0 },
+        { "ligRepeats",  "Ligature Repeats",  PType::Float, -1.0f, 1.0f,    0.0f,   0.0f,   Unit::Bipolar, nullptr, 0 },
+        { "ligTone",     "Ligature Tone",     PType::Float, -1.0f, 1.0f,    0.0f,   0.0f,   Unit::Tone,    nullptr, 0 },
+        { "ligDrive",    "Ligature Drive",    PType::Float, -12.0f, 18.0f,  0.0f,   0.0f,   Unit::Db,      nullptr, 0 },
+        { "ligFloat",    "Ligature Float",    PType::Float, 0.0f, 50.0f,    0.0f,   0.0f,   Unit::Ct,      nullptr, 0 },
+        { "ligRate",     "Ligature Rate",     PType::Float, 0.05f, 10.0f,   0.50f,  1.0f,   Unit::Hz,      nullptr, 0 },
+        { "ligAttack",   "Ligature Attack",   PType::Float, -1.0f, 1.0f,    0.0f,   0.0f,   Unit::Door,    nullptr, 0 },
+        { "ligOpen",     "Ligature Open",     PType::Float, 5.0f, 600.0f,   120.0f, 100.0f, Unit::Ms,      nullptr, 0 },
+        { "ligDuck",     "Ligature Duck",     PType::Float, -24.0f, 12.0f,  0.0f,   0.0f,   Unit::Db,      nullptr, 0 },
+        { "ligSoft",     "Ligature Soft",     PType::Float, 1.0f, 200.0f,   4.0f,   30.0f,  Unit::Ms,      nullptr, 0 },
+        { "ligReturn",   "Ligature Return",   PType::Float, 20.0f, 1500.0f, 140.0f, 200.0f, Unit::Ms,      nullptr, 0 },
+        // IMAGER for the Ligature echo
+        { "ligImgX1",      "Ligature Imager Split 1",  PType::Float, 40.0f, 1000.0f, 180.0f, 180.0f, Unit::Hz, nullptr, 0 },
+        { "ligImgX2",      "Ligature Imager Split 2",  PType::Float, 300.0f, 6000.0f, 1200.0f, 1200.0f, Unit::Hz, nullptr, 0 },
+        { "ligImgX3",      "Ligature Imager Split 3",  PType::Float, 1500.0f, 18000.0f, 5500.0f, 5500.0f, Unit::Hz, nullptr, 0 },
+        { "ligImgW1",      "Ligature Imager Width Low",      PType::Float, -1.0f, 1.0f, 0.0f, 0.0f, Unit::Bipolar, nullptr, 0 },
+        { "ligImgW2",      "Ligature Imager Width Low mid",  PType::Float, -1.0f, 1.0f, 0.0f, 0.0f, Unit::Bipolar, nullptr, 0 },
+        { "ligImgW3",      "Ligature Imager Width High mid", PType::Float, -1.0f, 1.0f, 0.0f, 0.0f, Unit::Bipolar, nullptr, 0 },
+        { "ligImgW4",      "Ligature Imager Width High",     PType::Float, -1.0f, 1.0f, 0.0f, 0.0f, Unit::Bipolar, nullptr, 0 },
+        { "ligImgS1",      "Ligature Imager Spread Low",      PType::Float, 0.0f, 1.0f, 0.0f, 0.0f, Unit::Percent, nullptr, 0 },
+        { "ligImgS2",      "Ligature Imager Spread Low mid",  PType::Float, 0.0f, 1.0f, 0.0f, 0.0f, Unit::Percent, nullptr, 0 },
+        { "ligImgS3",      "Ligature Imager Spread High mid", PType::Float, 0.0f, 1.0f, 0.0f, 0.0f, Unit::Percent, nullptr, 0 },
+        { "ligImgS4",      "Ligature Imager Spread High",     PType::Float, 0.0f, 1.0f, 0.0f, 0.0f, Unit::Percent, nullptr, 0 },
+        { "ligImgRecover", "Ligature Imager Recover",  PType::Float, 0.0f, 1.0f, 0.0f, 0.0f, Unit::Percent, nullptr, 0 },
     };
     return d;
 }

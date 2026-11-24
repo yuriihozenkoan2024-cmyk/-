@@ -14,7 +14,7 @@ juce::String MavkaAudioProcessor::formatValue (Unit unit, float v)
         case Unit::Ink:     return v > 0.004f ? "Ink " + pct (v) : (v < -0.004f ? "Press " + pct (-v) : juce::String ("Off"));
         case Unit::Slant:   return v > 0.004f ? "Scoop " + pct (v) : (v < -0.004f ? "Fall " + pct (-v) : juce::String ("Off"));
         case Unit::Tone:    return v > 0.004f ? "Bright " + pct (v) : (v < -0.004f ? "Dark " + pct (-v) : juce::String ("Neutral"));
-        case Unit::Db:      return (v > 0.04f ? "+" : "") + juce::String (v, 1) + " dB";
+        case Unit::Db:      return std::abs (v) < 0.05f ? juce::String ("0.0 dB") : (v > 0.0f ? "+" : "") + juce::String (v, 1) + " dB";
         case Unit::Hz:      return v < 9.995f ? juce::String (v, 2) + " Hz"
                                    : (v < 1000.0f ? juce::String (juce::roundToInt (v)) + " Hz" : juce::String (v / 1000.0f, 1) + " kHz");
         case Unit::Ms:      return v < 99.95f ? juce::String (v, 1) + " ms" : juce::String (juce::roundToInt (v)) + " ms";

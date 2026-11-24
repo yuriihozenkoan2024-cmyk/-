@@ -2170,17 +2170,17 @@ void ImagerField::setValue (const juce::String& id, float v)
 void ImagerField::splits (float* x) const
 {
     // as the engine uses them: at least a third of an octave apart
-    x[0] = value ("imgX1");
-    x[1] = juce::jmax (value ("imgX2"), x[0] * 1.26f);
-    x[2] = juce::jmax (value ("imgX3"), x[1] * 1.26f);
+    x[0] = value (prefix + "X1");
+    x[1] = juce::jmax (value (prefix + "X2"), x[0] * 1.26f);
+    x[2] = juce::jmax (value (prefix + "X3"), x[1] * 1.26f);
 }
 
 juce::String ImagerField::idFor (int t) const
 {
     if (t < 0)  return {};
-    if (t < 3)  return "imgX" + juce::String (t + 1);
-    if (t < 7)  return "imgW" + juce::String (t - 2);
-    return "imgS" + juce::String (t - 6);
+    if (t < 3)  return prefix + "X" + juce::String (t + 1);
+    if (t < 7)  return prefix + "W" + juce::String (t - 2);
+    return prefix + "S" + juce::String (t - 6);
 }
 
 int ImagerField::targetAt (juce::Point<float> pt, bool alt) const
@@ -2349,7 +2349,7 @@ void ImagerField::paint (juce::Graphics& g)
         const float yT = yOf (edges[b + 1]) + 3.0f, yB = yOf (edges[b]) - 3.0f;
         if (yB - yT < 6.0f)
             continue;
-        const float w = value ("imgW" + juce::String (b + 1)), sp = value ("imgS" + juce::String (b + 1));
+        const float w = value (prefix + "W" + juce::String (b + 1)), sp = value (prefix + "S" + juce::String (b + 1));
         const float e = 0.5f * (1.0f + w);
         const bool hot = hb == b;
         const float th = hot ? 1.7f : 1.1f;
@@ -2403,12 +2403,14 @@ void ImagerField::paint (juce::Graphics& g)
         g.drawText (lbl, box, juce::Justification::centred, false);
     }
 
-    if (! stereo || ! active)
+    const bool ligOff = forLigature && value ("ligature") < 0.0005f;
+    if (! stereo || ! active || ligOff)
     {
         g.setFont (sans (9.0f, false, 0.04f));
         g.setColour (theme::inkFaint);
-        g.drawText (! stereo ? "mono track: nothing to widen" : "neutral: the imager is out of the way",
-                    juce::Rectangle<float> (p.getRight() - 190.0f, p.getY() + 1.0f, 186.0f, 10.0f), juce::Justification::topRight, false);
+        g.drawText (! stereo ? "mono track: nothing to widen"
+                             : (ligOff ? "Ligature is at 0: no echo to widen" : "neutral: the imager is out of the way"),
+                    juce::Rectangle<float> (p.getRight() - 200.0f, p.getY() + 1.0f, 196.0f, 10.0f), juce::Justification::topRight, false);
     }
 }
 
@@ -2516,10 +2518,10 @@ void Page::paint (juce::Graphics& g)
             const auto a = l.area.toFloat();
             g.setColour (theme::ink.withAlpha (0.86f));
             g.setFont (sans (11.5f, true, 0.16f));
-            g.drawText (l.text, a.withTrimmedBottom (a.getHeight() * 0.5f + 1.0f), juce::Justification::centredBottom, false);
+            g.drawFittedText (l.text, a.withTrimmedBottom (a.getHeight() * 0.5f + 1.0f).toNearestInt(), juce::Justification::centredBottom, 1, 0.7f);
             g.setColour (theme::inkFaint);
             g.setFont (sans (9.5f, false, 0.04f));
-            g.drawText (l.sub, a.withTrimmedTop (a.getHeight() * 0.5f + 1.0f), juce::Justification::centredTop, false);
+            g.drawFittedText (l.sub, a.withTrimmedTop (a.getHeight() * 0.5f + 1.0f).toNearestInt(), juce::Justification::centredTop, 1, 0.7f);
         }
     }
     g.setColour (theme::inkSoft);
@@ -2652,7 +2654,8 @@ MavkaAudioProcessorEditor::MavkaAudioProcessorEditor (MavkaAudioProcessor& p)
     addKnob (surface, "slant", "Slant", true, { 128, 186, 104, 122 },
              "Slant: on every syllable the doubles draw a small pitch stroke. Scoop = dip and rise, Fall = up and settle.");
     addKnob (surface, "ligature", "Ligature", true, { 234, 186, 104, 122 },
-             "Ligature: a dirty echo in time with the song that only speaks between words, joining them.");
+             "Ligature: a dirty echo in time with the song that only speaks between words, joining them. "
+             "Fine controls (times, repeats, tone, how it opens...): the LIGATURE tab; its width by band: the IMAGER tab.");
     addKnob (surface, "inkTime", "Ink time", false, { 342, 196, 90, 106 },
              "Length of one pen stroke (Ink, Slant, the Pressure clip and the Stroke flanger).");
 
@@ -2695,14 +2698,14 @@ MavkaAudioProcessorEditor::MavkaAudioProcessorEditor (MavkaAudioProcessor& p)
     surface.addAndMakeVisible (clock);
 
     // ---- tabs
-    const char* tabNames[numPages] = { "HARDWARE", "CLOCK", "HARP", "VOICE", "FLANGE", "CLIP", "DOUBLES", "IMAGER" };
+    const char* tabNames[numPages] = { "HARDWARE", "CLOCK", "HARP", "VOICE", "FLANGE", "CLIP", "LIGATURE", "IMAGER", "DOUBLES" };
     for (int i = 0; i < numPages; ++i)
     {
         auto& t = tabs[(size_t) i];
         t.setButtonText (u8 (tabNames[i]));
         t.setClickingTogglesState (true);
         t.setRadioGroupId (4242);
-        t.setBounds (284 + juce::roundToInt ((float) i * 94.5f), 332, 92, 28);
+        t.setBounds (284 + i * 84, 332, 82, 28);
         t.onClick = [this, i] { showPage (i); };
         surface.addAndMakeVisible (t);
 
@@ -2851,8 +2854,114 @@ MavkaAudioProcessorEditor::MavkaAudioProcessorEditor (MavkaAudioProcessor& p)
             addKnob (pg, ks[i].id, ks[i].t, false, { 563 + (i % 3) * 64, (i / 3) * 102, 64, 100 }, ks[i].tip);
     }
     {
-        // DOUBLES: Glass and Fold, as finely as a delay. Every default is the sound of the earlier versions.
+        // LIGATURE: the ping-pong echo between the words, as finely as a delay. Every default is the earlier sound.
         auto& pg = pages[6];
+        pg.description = "Ligature - the dirty ping-pong echo that speaks between your words - as fine as a delay: the time of each "
+                         "side, repeats, their tone and drive, float, and how it opens on your words. Defaults = the earlier sound.";
+        pg.labels.push_back ({ "ECHO", "ping-pong", { 0, 38, 44, 80 }, false });
+        pg.labels.push_back ({ "WORDS", "opening", { 0, 122, 44, 80 }, false });
+        int x = 44;
+        auto knob = [&] (int y, const juce::String& id, const juce::String& title, const juce::String& tip) -> mavkaui::Knob&
+        {
+            auto& k = addKnob (pg, id, title, false, { x, y, 66, 80 }, tip);
+            x += 70;
+            return k;
+        };
+        knob (38, "ligature", "Level", "How loud the echo is, and how long it lasts by itself (the same knob as Ligature in "
+                                       "HANDWRITING). The fine controls below start from what it sets.");
+        addChoice (pg, "ligLeft", "Left", { x + 3, 38 + 19, 62, 44 },
+                   "The left echo, on the beat: 1/32 to 1/2 (T = triplet, . = dotted). Free: the ms knob next to it. "
+                   "1/8 = the earlier sound.");
+        x += 70;
+        syncedMs[0] = &knob (38, "ligLeftMs", "Left ms", "The left echo's time when Left is Free, in ms (double-click to type it).");
+        addChoice (pg, "ligRight", "Right", { x + 3, 38 + 19, 62, 44 },
+                   "The right echo, on the beat. Dotted 1/8 = the earlier sound; the same as Left = a straight ping-pong.");
+        x += 70;
+        syncedMs[1] = &knob (38, "ligRightMs", "Right ms", "The right echo's time when Right is Free, in ms.");
+        knob (38, "ligRepeats", "Repeats", "Feedback. 0 = what the Ligature knob sets; + up to 97 % (a long trail), - down to none "
+                                           "(one echo per word).");
+        knob (38, "ligTone", "Tone", "The tone of the repeats: Dark loses the top with every pass, Bright loses the body. "
+                                     "Neutral = as before.");
+        knob (38, "ligDrive", "Drive", "How hard the repeats saturate on every pass (the dirt of the echo), in dB. 0 = as before.");
+        knob (38, "ligFloat", "Float", "A slow pitch drift of the echo, in cents - a tape echo that wanders. The right side drifts a "
+                                       "quarter turn behind the left. 0 = as before.");
+        knob (38, "ligRate", "Rate", "How fast the echo drifts (0.05 - 10 Hz).");
+        x = 44;
+        knob (122, "ligAttack", "Attack", "What of each word goes into the echo. Skip: not its first transient - the echo blooms "
+                                          "from the body of the word. Grab: mostly the attack - consonants bounce around. "
+                                          "Natural = as before.");
+        knob (122, "ligOpen", "Open", "How softly the echo's door opens (Skip) or closes (Grab) after the attack, in ms.");
+        knob (122, "ligDuck", "Duck", "How deep your voice presses the echo while you sing, against the DUCK settings in AURA: "
+                                      "- = it stays louder under the voice, + = it hides deeper. 0 = as before.");
+        knob (122, "ligSoft", "Soft", "How softly the echo hears your voice come in: short = it ducks at once, long = it fades under "
+                                      "the first syllables. 4 ms = as before.");
+        knob (122, "ligReturn", "Return", "How fast the echo comes back once you stop: short = it jumps into every little pause, "
+                                          "long = it swells in slowly. 140 ms = as before.");
+        pg.notes = u8 ("LIGATURE\n"
+                       "speaks in the pauses, joins the words\n"
+                       "duck mode, depth, feed \xe2\x86\x92 AURA \xc2\xb7 DUCK\n"
+                       "its width by band \xe2\x86\x92 the IMAGER tab");
+        pg.notesArea = { 410, 130, 340, 80 };
+    }
+    {
+        // IMAGER: two of them - the Ligature echo's and the doubles' - each with its own four bands
+        auto& pg = pages[7];
+        const char* pickNames[2] = { "LIGATURE", "DOUBLES" };
+        const char* pickTips[2] = { "The width of the Ligature echo, band by band.",
+                                    "The width of MAVKA's own sound (mostly its doubles), band by band - before the Ligature joins it." };
+        for (int i = 0; i < 2; ++i)
+        {
+            auto& b = imgPick[i];
+            b.setButtonText (pickNames[i]);
+            b.setTooltip (pickTips[i]);
+            b.setClickingTogglesState (false);
+            b.onClick = [this, i] { pickImager (i); };
+            b.setBounds (24 + i * 96, 0, 92, 24);
+            pg.addAndMakeVisible (b);
+        }
+        imagerField.setBounds (0, 26, 376, 178);
+        imagerField.setTooltip ("The width across the spectrum: low at the bottom, high at the top, the stereo field left to right. "
+                                "Every ink stroke is a slice of frequencies - its length is how wide it is, its darkness how loud, "
+                                "the tick is where it sits. Blood: what the imager widened; a hairline: where it reached before. "
+                                "Drag a dashed split up / down; drag inside a band left / right to narrow or widen it (Alt: its "
+                                "Spread, Shift: fine); double-click to reset. The mono sum never changes.");
+        pg.addAndMakeVisible (imagerField);
+        pg.labels.push_back ({ "WIDTH", {}, { 380, 2, 12, 100 }, true });
+        pg.labels.push_back ({ "SPREAD", {}, { 380, 104, 12, 100 }, true });
+        pg.dividerX = 394 + 4 * 60 - 1;
+        pg.dividerTop = 8;
+        const char* bandNames[4] = { "Low", "Low mid", "High mid", "High" };
+        const char* bandLong[4] = { "low", "low-mid", "high-mid", "high" };
+        for (int which = 0; which < 2; ++which)
+        {
+            const juce::String pre = which == 0 ? "ligImg" : "img";
+            const juce::String what = which == 0 ? "the Ligature echo" : "MAVKA's own sound (its doubles)";
+            auto& set = imgKnobs[which];
+            for (int b = 0; b < 4; ++b)
+            {
+                set.push_back (&addKnob (pg, pre + "W" + juce::String (b + 1), bandNames[b], false, { 394 + b * 60, 2, 60, 100 },
+                                         "Width of " + what + " in the " + juce::String (bandLong[b]) + " band: -100% = mono, 0% = as "
+                                         "it is, +100% = twice as wide. Only the side changes - the mono sum stays exactly the same."));
+                set.push_back (&addKnob (pg, pre + "S" + juce::String (b + 1), bandNames[b], false, { 394 + b * 60, 104, 60, 100 },
+                                         "Spread for the " + juce::String (bandLong[b]) + " band of " + what + ": a dispersed copy of "
+                                         "its middle goes out to the sides - width for what has none. Mono-safe."));
+            }
+            set.push_back (&addKnob (pg, pre + "X1", "Split 1", false, { 634, 2, 60, 100 },
+                                     "Where the low and the low-mid band meet (Linkwitz-Riley, 24 dB / octave). Drag the dashed line "
+                                     "in the picture too."));
+            set.push_back (&addKnob (pg, pre + "X2", "Split 2", false, { 694, 2, 60, 100 },
+                                     "Where the low-mid and the high-mid band meet. Drag the dashed line in the picture too."));
+            set.push_back (&addKnob (pg, pre + "X3", "Split 3", false, { 634, 104, 60, 100 },
+                                     "Where the high-mid and the high band meet. Drag the dashed line in the picture too."));
+            set.push_back (&addKnob (pg, pre + "Recover", "Recover", false, { 694, 104, 60, 100 },
+                                     "When you narrow a band, what leaves its sides comes back in the middle (dispersed, so it adds "
+                                     "body instead of combing) - " + what + " keeps its weight in mono. Acts only on narrowed bands."));
+        }
+        pickImager (0);
+    }
+    {
+        // DOUBLES: Glass and Fold, as finely as a delay. Every default is the sound of the earlier versions.
+        auto& pg = pages[8];
         pg.description = "Glass and Fold - the doubles behind MAVKA's delay-like shadow - as fine as a delay: time (free or on "
                          "the beat), repeats, float, tone, drive, and how they open on a word. Defaults = the sound of earlier versions.";
         auto row = [&] (bool glass, int y)
@@ -2868,9 +2977,12 @@ MavkaAudioProcessorEditor::MavkaAudioProcessorEditor (MavkaAudioProcessor& p)
             };
             knob (base, "Level", "How loud " + who + " is (the same knob as " + juce::String (glass ? "Glass" : "Fold")
                               + " on the HARDWARE tab).");
-            knob (base + "Time", "Time", "How far " + who + " sits behind your voice, in ms (double-click the number to type it). "
+            auto& timeKnob = addKnob (pg, base + "Time", "Time", false, { x, y, 64, 80 },
+                                      "How far " + who + " sits behind your voice, in ms (double-click the number to type it). "
                                       + juce::String (glass ? "23 ms" : "37 ms") + " = the sound of earlier versions. The right "
                                       "channel keeps its offset from Width (CLOCK tab).");
+            syncedMs[glass ? 2 : 3] = &timeKnob;
+            x += 64;
             addChoice (pg, base + "Sync", "Sync", { x + 2, y + 19, 60, 44 },
                        "Free: the Time knob. Or lock " + who + " to the song: 1/64 to 1/8 (T = triplet) at the project tempo "
                        "(300 ms at most).");
@@ -2894,41 +3006,6 @@ MavkaAudioProcessorEditor::MavkaAudioProcessorEditor (MavkaAudioProcessor& p)
         };
         row (true, 38);
         row (false, 122);
-    }
-    {
-        // IMAGER: the width of the wet sound in four bands
-        auto& pg = pages[7];
-        imagerField.setBounds (0, 0, 376, 204);
-        imagerField.setTooltip ("The width of MAVKA's sound across the spectrum: low at the bottom, high at the top, the stereo "
-                                "field left to right. Every ink stroke is a slice of frequencies - its length is how wide it is, "
-                                "its darkness how loud, the tick is where it sits. Blood: what the imager widened; a hairline: "
-                                "where it reached before. Drag a dashed split up / down; drag inside a band left / right to "
-                                "narrow or widen it (Alt: its Spread, Shift: fine); double-click to reset. The mono sum never changes.");
-        pg.addAndMakeVisible (imagerField);
-        pg.labels.push_back ({ "WIDTH", {}, { 380, 2, 12, 100 }, true });
-        pg.labels.push_back ({ "SPREAD", {}, { 380, 104, 12, 100 }, true });
-        pg.dividerX = 394 + 4 * 60 - 1;
-        pg.dividerTop = 8;
-        const char* bandNames[4] = { "Low", "Low mid", "High mid", "High" };
-        const char* bandLong[4] = { "low", "low-mid", "high-mid", "high" };
-        for (int b = 0; b < 4; ++b)
-        {
-            addKnob (pg, "imgW" + juce::String (b + 1), bandNames[b], false, { 394 + b * 60, 2, 60, 100 },
-                     "Width of MAVKA's sound in the " + juce::String (bandLong[b]) + " band: -100% = mono, 0% = as it is, "
-                     "+100% = twice as wide. Only the side changes - the mono sum stays exactly the same.");
-            addKnob (pg, "imgS" + juce::String (b + 1), bandNames[b], false, { 394 + b * 60, 104, 60, 100 },
-                     "Spread for the " + juce::String (bandLong[b]) + " band: a dispersed copy of its middle goes out to the "
-                     "sides - width for what has none. Mono-safe: the mono sum stays exactly the same.");
-        }
-        addKnob (pg, "imgX1", "Split 1", false, { 634, 2, 60, 100 },
-                 "Where the low and the low-mid band meet (Linkwitz-Riley, 24 dB / octave). Drag the dashed line in the picture too.");
-        addKnob (pg, "imgX2", "Split 2", false, { 694, 2, 60, 100 },
-                 "Where the low-mid and the high-mid band meet. Drag the dashed line in the picture too.");
-        addKnob (pg, "imgX3", "Split 3", false, { 634, 104, 60, 100 },
-                 "Where the high-mid and the high band meet. Drag the dashed line in the picture too.");
-        addKnob (pg, "imgRecover", "Recover", false, { 694, 104, 60, 100 },
-                 "When you narrow a band, what leaves its sides comes back in the middle (dispersed, so it adds body instead of "
-                 "combing) - the double keeps its weight in mono. Acts only on narrowed bands.");
     }
 
     // ---- AURA: nonlinear send effects
@@ -3134,7 +3211,21 @@ void MavkaAudioProcessorEditor::showPage (int index)
         pages[(size_t) i].setVisible (i == index);
     currentPage = index;
     proc.engine.setMetering (index == 5);   // the overtone map and the scope cost a little: only while they are seen
-    proc.engine.setImagerMetering (index == 7);
+    proc.engine.setImagerMetering (index == 7 ? imagerWhich : -1);
+}
+
+void MavkaAudioProcessorEditor::pickImager (int which)
+{
+    imagerWhich = which;
+    for (int i = 0; i < 2; ++i)
+    {
+        imgPick[i].setToggleState (i == which, juce::dontSendNotification);
+        for (auto* k : imgKnobs[i])
+            k->setVisible (i == which);
+    }
+    imagerField.setPrefix (which == 0 ? "ligImg" : "img", which == 0);
+    if (currentPage == 7)
+        proc.engine.setImagerMetering (which);
 }
 
 void MavkaAudioProcessorEditor::paint (juce::Graphics& g)
@@ -3209,8 +3300,20 @@ void MavkaAudioProcessorEditor::timerCallback()
             b.resize ((size_t) n);
         e.copyImager (imgBuf[0].data(), imgBuf[1].data(), imgBuf[2].data(), imgBuf[3].data());
         imagerField.setData (imgBuf[0].data(), imgBuf[1].data(), imgBuf[2].data(), imgBuf[3].data(), n,
-                             proc.getSampleRate() > 0.0 ? proc.getSampleRate() : 48000.0, e.isImagerActive(),
+                             proc.getSampleRate() > 0.0 ? proc.getSampleRate() : 48000.0, e.isImagerActive (imagerWhich),
                              proc.getTotalNumOutputChannels() > 1);
+    }
+    {
+        // a time knob that does nothing while its side is on the beat fades back
+        const char* syncs[4] = { "ligLeft", "ligRight", "glassSync", "foldSync" };
+        for (int i = 0; i < 4; ++i)
+            if (syncedMs[i] != nullptr)
+                if (auto* sv = proc.apvts.getRawParameterValue (syncs[i]))
+                {
+                    const float a = sv->load() < 0.5f ? 1.0f : 0.4f;
+                    if (std::abs (syncedMs[i]->getAlpha() - a) > 0.01f)
+                        syncedMs[i]->setAlpha (a);
+                }
     }
 
     updateTextures (false);

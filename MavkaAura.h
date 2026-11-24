@@ -292,11 +292,13 @@ public:
     void reset() noexcept
     {
         bank.reset();
-        for (int b = 0; b < DuckBands::kBands; ++b) { ref[b] = 0.0f; level[b] = 0.0f; presence[b] = 0.0f; }
+        for (int b = 0; b < DuckBands::kBands; ++b) { ref[b] = 0.0f; level[b] = 0.0f; presence[b] = 0.0f; presence2[b] = 0.0f; }
     }
 
-    // voice: latency-aligned dry voice (mono); gate: 0..1 "the voice is singing at all"
-    inline void process (float voice, float gate) noexcept
+    // voice: latency-aligned dry voice (mono); gate: 0..1 "the voice is singing at all" (gate2: the same seen by
+    // the Ligature, which has its own sense of when the voice starts and stops)
+    inline void process (float voice, float gate) noexcept { process (voice, gate, gate); }
+    inline void process (float voice, float gate, float gate2) noexcept
     {
         bank.process (voice, level);
         float strongest = 1.0e-7f;
@@ -309,13 +311,15 @@ public:
         {
             // the voice occupies a band when the band is near its own recent peak (12..30 dB)
             // AND is not negligible next to the voice's strongest band (25..40 dB)
-            presence[b] = gate * smoothstep (0.0316f, 0.25f, level[b] / (ref[b] + 1.0e-7f))
-                               * smoothstep (0.01f, 0.056f, level[b] / strongest);
+            const float near = smoothstep (0.0316f, 0.25f, level[b] / (ref[b] + 1.0e-7f));
+            const float loud = smoothstep (0.01f, 0.056f, level[b] / strongest);
+            presence[b] = gate * near * loud;
+            presence2[b] = gate2 * near * loud;
         }
     }
 
     float level[DuckBands::kBands] {};
-    float presence[DuckBands::kBands] {};
+    float presence[DuckBands::kBands] {}, presence2[DuckBands::kBands] {};
 
 private:
     SelectiveBank bank;
@@ -336,6 +340,12 @@ public:
         aRel = timeCoef (140.0f, fs);
         reset();
     }
+    // how fast the voice presses the FX down (attack) and how fast it comes back in a pause (release)
+    void setTimes (float atkMs, float relMs, float fs) noexcept
+    {
+        aAtk = timeCoef (atkMs, fs);
+        aRel = timeCoef (relMs, fs);
+    }
     void reset() noexcept
     {
         for (auto& ch : cut) for (auto& f : ch) f.reset();
@@ -345,15 +355,16 @@ public:
 
     // L/R: FX return, ducked in place. margin: how far (linear) the FX must stay under the voice; floor: deepest cut.
     // Each band is a dynamic peaking cut (x - c * bandpass(x)): with no voice the signal passes exactly.
-    inline void process (const DuckKey& key, float& L, float& R, float margin, float floor) noexcept
+    inline void process (const DuckKey& key, float& L, float& R, float margin, float floor, bool second = false) noexcept
     {
+        const float* pres = second ? key.presence2 : key.presence;
         float fxLevel[DuckBands::kBands];
         bank.process (0.5f * (L + R), fxLevel);
         float yL = L, yR = R;
         for (int b = 0; b < DuckBands::kBands; ++b)
         {
             const float target = clampf (key.level[b] * margin / (fxLevel[b] + 1.0e-7f), floor, 1.0f);
-            const float gt = 1.0f - key.presence[b] * (1.0f - target);
+            const float gt = 1.0f - pres[b] * (1.0f - target);
             gain[b] = gt + (gt < gain[b] ? aAtk : aRel) * (gain[b] - gt);
             const float c = 1.0f - gain[b];
             yL -= c * cut[0][b].process (L);

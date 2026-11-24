@@ -201,6 +201,152 @@ struct ImgDisperse
     inline float process (float x) noexcept { for (auto& b : ap) x = b.process (x); return x; }
 };
 
+// IMAGER: the width of a stereo sound in four bands (Ozone-style). Only the side changes; the mid takes the same
+// all-pass as the bands, so the mono sum never moves. Out of the way (bypassed) while every band is at 0.
+struct Imager
+{
+    ImgSplit splitS, splitD;
+    ImgSum sumS, sumD, sumR;
+    Biquad apM[3], apDry[2][3];
+    ImgDisperse spread, recover;
+    float g[4] = { 1.0f, 1.0f, 1.0f, 1.0f }, sp[4] {}, rec = 0.0f, x[3] = { -1.0f, -1.0f, -1.0f }, mix = 0.0f;
+    float gT[4] = { 1.0f, 1.0f, 1.0f, 1.0f }, spT[4] {}, recT = 0.0f;   // this block's settings
+    int quiet = 0;
+    bool on = false, live = false, spreadLive = false, recLive = false, spreadWant = false, recWant = false;
+
+    void prepare (const float* spreadHz, const float* recoverHz, double fs)
+    {
+        spread.design (spreadHz, fs);
+        recover.design (recoverHz, fs);
+        clear();
+    }
+    void reset() noexcept   // the filters (a fresh start the next time it engages)
+    {
+        splitS.reset(); splitD.reset();
+        sumS.reset(); sumD.reset(); sumR.reset();
+        for (auto& b : apM) b.reset();
+        for (auto& c : apDry) for (auto& b : c) b.reset();
+        spread.reset(); recover.reset();
+        live = spreadLive = recLive = false;
+    }
+    void clear() noexcept   // everything
+    {
+        reset();
+        mix = 0.0f; quiet = 0; on = false; rec = 0.0f;
+        for (int b = 0; b < 4; ++b) { g[b] = 1.0f; sp[b] = 0.0f; }
+        for (auto& c : x) c = -1.0f;
+    }
+
+    // per block: the 12 settings from `base` (Split 1-3, Width 1-4, Spread 1-4, Recover); `allowed`: a stereo
+    // sound flows through it. Engages at once, lets go after a second at neutral (automation through 0 does not flip it).
+    void update (const float* v, int base, bool allowed, int n, double fs) noexcept
+    {
+        const float fsf = (float) fs;
+        bool want = false;
+        spreadWant = false;
+        for (int b = 0; b < 4; ++b)
+        {
+            gT[b] = 1.0f + clampf (v[base + 3 + b], -1.0f, 1.0f);
+            spT[b] = clampf (v[base + 7 + b], 0.0f, 1.0f);
+            if (std::fabs (gT[b] - 1.0f) > 1.0e-4f || spT[b] > 1.0e-4f) want = true;
+            if (spT[b] > 1.0e-4f) spreadWant = true;
+        }
+        recT = clampf (v[base + 11], 0.0f, 1.0f);
+        recWant = recT > 1.0e-4f && (gT[0] < 0.9999f || gT[1] < 0.9999f || gT[2] < 0.9999f || gT[3] < 0.9999f);
+        want = want && allowed;
+        if (want) quiet = 0;
+        else if (quiet < 1 << 20) quiet += n;
+        on = want || (live && quiet < (int) fsf);
+        if (! (on || live))
+            return;
+        // the crossovers keep at least a third of an octave apart, and glide (a fifth of the way per block)
+        float xt[3] = { clampf (v[base], 20.0f, 0.4f * fsf), clampf (v[base + 1], 20.0f, 0.4f * fsf), clampf (v[base + 2], 20.0f, 0.4f * fsf) };
+        xt[1] = std::min (std::max (xt[1], xt[0] * 1.26f), 0.4f * fsf);
+        xt[2] = std::min (std::max (xt[2], xt[1] * 1.26f), 0.42f * fsf);
+        bool moved = x[0] < 0.0f;
+        for (int i = 0; i < 3; ++i)
+        {
+            const float nx = x[i] < 0.0f ? xt[i] : x[i] * std::pow (xt[i] / x[i], 0.2f);
+            if (std::fabs (nx - x[i]) > 1.0e-3f * xt[i]) { x[i] = nx; moved = true; }
+        }
+        if (moved)
+        {
+            splitS.design (x, fs); splitD.design (x, fs);
+            sumS.design (x, fs); sumD.design (x, fs); sumR.design (x, fs);
+            for (int i = 0; i < 3; ++i)
+            {
+                apM[i].allpass (x[i], 0.70710678, fs);
+                apDry[0][i].allpass (x[i], 0.70710678, fs);
+                apDry[1][i].allpass (x[i], 0.70710678, fs);
+            }
+        }
+    }
+
+    // one stereo sample; the gains glide here (aS), the whole imager fades in / out (aImg)
+    inline void step (float& L, float& R, float aS, float aImg) noexcept
+    {
+        if (! live) { reset(); live = true; }
+        mix += ((on ? 1.0f : 0.0f) - mix) * aImg;
+        for (int b = 0; b < 4; ++b)
+        {
+            g[b] += (gT[b] - g[b]) * aS;
+            sp[b] += (spT[b] - sp[b]) * aS;
+        }
+        rec += ((recWant ? recT : 0.0f) - rec) * aS;
+
+        const float m = 0.5f * (L + R), s = 0.5f * (L - R);
+        float bs[4];
+        splitS.split (s, bs);
+        float s2 = sumS.sum (bs, g);
+
+        // SPREAD: a dispersed copy of the mid goes into the side of its band - width for what has none
+        if (spreadWant || sp[0] + sp[1] + sp[2] + sp[3] > 1.0e-5f)
+        {
+            if (! spreadLive) { spread.reset(); splitD.reset(); sumD.reset(); spreadLive = true; }
+            float bd[4];
+            splitD.split (spread.process (m), bd);
+            s2 += 0.7f * sumD.sum (bd, sp);
+        }
+        else spreadLive = false;
+
+        float m2 = apM[2].process (apM[1].process (apM[0].process (m)));
+
+        // RECOVER: what narrowing takes out of the side comes back in the middle (dispersed, so it adds body
+        // instead of combing with the mid)
+        if (recWant || rec > 1.0e-5f)
+        {
+            if (! recLive) { recover.reset(); sumR.reset(); recLive = true; }
+            const float rg[4] = { std::max (0.0f, 1.0f - g[0]), std::max (0.0f, 1.0f - g[1]),
+                                  std::max (0.0f, 1.0f - g[2]), std::max (0.0f, 1.0f - g[3]) };
+            m2 += rec * 0.7f * recover.process (sumR.sum (bs, rg));
+        }
+        else recLive = false;
+
+        L += mix * (m2 + s2 - L);
+        R += mix * (m2 - s2 - R);
+    }
+
+    // the same all-pass for a sound that must stay in phase with what went through the imager (the dry)
+    inline void allpassAlong (float* d) noexcept
+    {
+        for (int c = 0; c < 2; ++c)
+        {
+            const float a = apDry[c][2].process (apDry[c][1].process (apDry[c][0].process (d[c])));
+            d[c] += mix * (a - d[c]);
+        }
+    }
+
+    // after the sample: a faded-out imager lets go
+    inline void settle() noexcept
+    {
+        if (live && ! on && mix < 1.0e-4f)
+        {
+            reset();
+            mix = 0.0f;
+        }
+    }
+};
+
 // what the core added, for the GUI (filled by the active path's left channel)
 struct CoreMonitor
 {
@@ -751,8 +897,12 @@ public:
             postR[i] = imgPostR[r].load (std::memory_order_relaxed);
         }
     }
-    void setImagerMetering (bool b) noexcept { imgMetering.store (b, std::memory_order_relaxed); }
-    bool isImagerActive() const noexcept { return guiImgOn.load (std::memory_order_relaxed); }
+    // which imager the GUI looks at: -1 none, 0 the Ligature's, 1 the doubles'
+    void setImagerMetering (int which) noexcept { imgMetering.store (which, std::memory_order_relaxed); }
+    bool isImagerActive (int which) const noexcept
+    {
+        return (which == 0 ? guiImgOnL : guiImgOnD).load (std::memory_order_relaxed);
+    }
     double getSampleRate() const noexcept { return fs; }
 
     void process (float* const* io, int numCh, int n) noexcept
@@ -775,15 +925,6 @@ public:
 
 private:
     void processSub (float* const* io, int numCh, int off, int n) noexcept;
-    void resetImager() noexcept
-    {
-        imgSplitS.reset(); imgSplitD.reset();
-        imgSumS.reset(); imgSumD.reset(); imgSumR.reset();
-        for (auto& b : imgApM) b.reset();
-        for (auto& c : imgApDry) for (auto& b : c) b.reset();
-        imgSpread.reset(); imgRecover.reset();
-        imgLive = imgSpreadLive = imgRecLive = false;
-    }
     void updateBlock() noexcept;
     void computeProbe() noexcept;
     int  desiredPath (int n) noexcept;
@@ -857,7 +998,7 @@ private:
     bool rsLive = false;
 
     // mono analysis
-    Envelope envCons, inkFast, inkSlow, vEnvLo, vEnvHi;
+    Envelope envCons, inkFast, inkSlow, vEnvLo, vEnvHi, envLig;
     Biquad vLP, vHP;
     float gNdb = 0.0f, voiced = 1.0f, strokeRem = 0.0f, lastEnvDb = -100.0f;
     long sinceOnset = 1L << 30, minOnsetGap = 3000;
@@ -870,6 +1011,11 @@ private:
     DelayLine ligL, ligR;
     OnePole ligLP[2], ligHP[2];
     float ligTL = 0.0f, ligTR = 0.0f, ligDuck = 1.0f, aLigT = 0.001f, aDuckAtk = 0.9f, aDuckRel = 0.99f;
+    // LIGATURE, finely: its own duck (classic mode), its door on the words, its float, and the cached settings
+    float ligDuck2 = 1.0f, aLigAtk = 0.9f, aLigRel = 0.99f, ligDoorS = 1.0f, ligPh = 0.0f;
+    float ligToneCache = 0.0f, ligSoftCache = 4.0f, ligReturnCache = 140.0f;
+    float ligDuckBuf[kSub] {};
+    DelayLine ctlLigDoor;
     float duckBuf[kSub] {};
     float loudRef = -70.0f, loudFall = 0.0f;
 
@@ -909,19 +1055,13 @@ private:
     // THE DOUBLES: their slow float (phase) and their attack doors (delayed by each double's own time)
     float floatPhG = 0.0f, floatPhF = 0.25f, doorGs = 1.0f, doorFs = 1.0f, aDoor = 0.1f;
     DelayLine doorG, doorF;
-    // IMAGER: the side of the wet sound in four bands; the mid and the dry get the very same all-pass, so
-    // nothing moves against anything and the mono sum never changes
-    ImgSplit imgSplitS, imgSplitD;
-    ImgSum imgSumS, imgSumD, imgSumR;
-    Biquad imgApM[3], imgApDry[2][3];
-    ImgDisperse imgSpread, imgRecover;
-    float imgG[4] = { 1.0f, 1.0f, 1.0f, 1.0f }, imgSp[4] {}, imgRec = 0.0f, imgX[3] = { -1.0f, -1.0f, -1.0f };
-    float imgMix = 0.0f, aImg = 0.01f;
-    int imgQuiet = 0;
-    bool imgLive = false, imgSpreadLive = false, imgRecLive = false;
+    // IMAGER: two of them, each with its own four bands - the doubles (MAVKA's own sound before the Ligature joins
+    // it; the dry takes the same all-pass, so dry and wet never comb) and the Ligature echo
+    Imager imgDbl, imgLig;
+    float aImg = 0.01f;
     std::atomic<float> imgPreL[kImg], imgPreR[kImg], imgPostL[kImg], imgPostR[kImg];
-    std::atomic<int> imgPos { 0 };
-    std::atomic<bool> imgMetering { false }, guiImgOn { false };
+    std::atomic<int> imgPos { 0 }, imgMetering { -1 };
+    std::atomic<bool> guiImgOnD { false }, guiImgOnL { false };
     inkey::Comp compInt, compAll;   // leakage compensation: the overtone bands alone / with the half-overtone bands
     float gNslowDb = 0.0f, aGnSlow = 0.001f;                 // POLISH density: the slow part of the leveling
     CoreMonitor mon;
@@ -1003,6 +1143,8 @@ inline void Engine::prepare (double sampleRate, int /*numChannels*/)
     lampPre = std::max (1, (int) std::lrint (0.0008 * fs));
     lampBaseMs = 1000.0f * (float) lampPre / fsf;
     totalLat = latencyMax + lampPre;
+    ctlLigDoor.prepare (totalLat + kSub + 8);
+    ctlLigDoor.fill (1.0f);   // the door starts open
 
     for (auto& c : ch)
     {
@@ -1038,8 +1180,8 @@ inline void Engine::prepare (double sampleRate, int /*numChannels*/)
         const float nyq = 0.45f * fsf;
         const float spF[ImgDisperse::kN] = { 150.0f, 420.0f, 1100.0f, 2900.0f, 6800.0f, std::min (13500.0f, nyq) };
         const float rcF[ImgDisperse::kN] = { 230.0f, 610.0f, 1600.0f, 4100.0f, 9200.0f, std::min (16500.0f, nyq) };
-        imgSpread.design (spF, fs);
-        imgRecover.design (rcF, fs);
+        imgDbl.prepare (spF, rcF, fs);
+        imgLig.prepare (spF, rcF, fs);
     }
     aImg = smoothCoef (25.0f, fsf);
     for (int i = 0; i < kImg; ++i)
@@ -1065,6 +1207,7 @@ inline void Engine::prepare (double sampleRate, int /*numChannels*/)
     }
 
     envCons.set (5.0f, 150.0f, fsf);
+    envLig.set (5.0f, 150.0f, fsf);
     inkFast.set (0.5f, 15.0f, fsf);
     inkSlow.set (25.0f, 150.0f, fsf);
     vEnvLo.set (1.0f, 20.0f, fsf);
@@ -1105,6 +1248,9 @@ inline void Engine::prepare (double sampleRate, int /*numChannels*/)
     forestVersion = -1;
     aDuckAtk = timeCoef (8.0f, fsf);
     aDuckRel = timeCoef (150.0f, fsf);
+    aLigAtk = timeCoef (8.0f, fsf);
+    aLigRel = timeCoef (150.0f, fsf);
+    ligToneCache = 0.0f; ligSoftCache = 4.0f; ligReturnCache = 140.0f;   // as the filters / duck were just prepared
     warmLen = (int) (0.05 * fs) + latencyMax;
     fadeLen = std::max (1, (int) (0.03 * fs));
 
@@ -1167,14 +1313,11 @@ inline void Engine::reset() noexcept
     gNslowDb = 0.0f;
     floatPhG = 0.0f; floatPhF = 0.25f; doorGs = doorFs = 1.0f;
     doorG.reset(); doorF.reset();
-    resetImager();
-    imgMix = 0.0f; imgQuiet = 0;
-    for (int b = 0; b < 4; ++b) { imgG[b] = 1.0f; imgSp[b] = 0.0f; }
-    imgRec = 0.0f;
-    for (auto& x : imgX) x = -1.0f;
+    imgDbl.clear();
+    imgLig.clear();
     mon = CoreMonitor();
     for (float& l : otLevelS) l = -120.0f;
-    envCons.reset(); inkFast.reset(); inkSlow.reset(); vEnvLo.reset(); vEnvHi.reset();
+    envCons.reset(); inkFast.reset(); inkSlow.reset(); vEnvLo.reset(); vEnvHi.reset(); envLig.reset();
     vLP.reset(); vHP.reset();
     gNdb = 0.0f; voiced = 1.0f; strokeRem = 0.0f; lastEnvDb = -100.0f;
     sinceOnset = 1L << 30;
@@ -1185,6 +1328,9 @@ inline void Engine::reset() noexcept
     for (int c = 0; c < 2; ++c) { ligLP[c].reset(); ligHP[c].reset(); }
     ligTL = ligTR = 0.0f;
     ligDuck = 1.0f;
+    ligDuck2 = 1.0f; ligDoorS = 1.0f; ligPh = 0.0f;
+    ctlLigDoor.reset();
+    ctlLigDoor.fill (1.0f);
     loudRef = -70.0f;
     aEcho.reset(); aForest.reset(); aTwin.reset(); fxHP.reset(); fxLP.reset();
     duckKey.reset(); duckLig.reset(); duckAura.reset();
@@ -1432,6 +1578,19 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
     const float attG = v[P_GATTACK], attF = v[P_FATTACK];
     const float openG = 1.0f / (0.001f * std::max (5.0f, v[P_GOPEN]) * fsf), openF = 1.0f / (0.001f * std::max (5.0f, v[P_FOPEN]) * fsf);
     const float doorDG = 0.001f * timeG * fsf, doorDF = 0.001f * timeF * fsf;
+    const float attLg = v[P_LATTACK], openLg = 1.0f / (0.001f * std::max (5.0f, v[P_LOPEN]) * fsf);
+    {
+        // Ligature's duck: Soft = how fast the voice presses it, Return = how fast it comes back in a pause
+        const float soft = v[P_LSOFT], ret = v[P_LRETURN];
+        if (std::fabs (soft - ligSoftCache) > 1.0e-6f || std::fabs (ret - ligReturnCache) > 1.0e-6f)
+        {
+            ligSoftCache = soft; ligReturnCache = ret;
+            duckLig.setTimes (soft, ret, fsf);
+            aLigAtk = timeCoef (2.0f * soft, fsf);              // classic duck: 8 ms / 150 ms at the defaults
+            aLigRel = timeCoef (ret * 150.0f / 140.0f, fsf);
+            envLig.set (5.0f * soft / 4.0f, ret * 150.0f / 140.0f, fsf);   // how fast it hears the voice: 5 / 150 ms
+        }
+    }
     // the door of a double after an onset: -1 = closed on the attack, opens after it; +1 = only the attack
     auto door = [] (float att, float since, float inv) noexcept
     {
@@ -1590,6 +1749,14 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
         auraC[j] = lfoL[0];
         ligDuck = duckT + (duckT < ligDuck ? aDuckAtk : aDuckRel) * (ligDuck - duckT);
         duckBuf[j] = ligDuck;
+        // the Ligature hears the voice come and go with its own Soft / Return (the same as the rest at the defaults)
+        const float envLigDb = gainToDb (envLig.process (mono));
+        const float duckTL = 1.0f - 0.92f * smoothstep (-30.0f, -12.0f, envLigDb - loudRef) * smoothstep (-62.0f, -50.0f, envLigDb);
+        ligDuck2 = duckTL + (duckTL < ligDuck2 ? aLigAtk : aLigRel) * (ligDuck2 - duckTL);
+        ligDuckBuf[j] = ligDuck2;
+        ligDoorS += ((std::fabs (attLg) < 1.0e-6f ? 1.0f : door (attLg, (float) sinceOnset, openLg)) - ligDoorS) * aDoor;
+        if (std::fabs (attLg) < 1.0e-6f && std::fabs (ligDoorS - 1.0f) < 1.0e-5f) ligDoorS = 1.0f;
+        ctlLigDoor.push (ligDoorS);
         float tDriveDb, tDop, tWet, tHarp;
         if (ink >= 0.0f)
         {   // Ink: starts clean, the distortion spreads over the word
@@ -1956,8 +2123,8 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
     const bool spectral = duckMode == 0;
     // Depth: how far the echo must stay under the voice (spectral) / how deep the whole return dips (classic)
     const float depthDb = 6.0f + 18.0f * v[P_DUCKDEPTH];
-    const float auraMargin = dbToGain (-depthDb), ligMargin = dbToGain (-(depthDb + 3.0f)), duckFloor = dbToGain (-30.0f);
-    const float ligClassic = dbToGain (-(depthDb + 6.0f));
+    const float auraMargin = dbToGain (-depthDb), ligMargin = dbToGain (-(depthDb + 3.0f + v[P_LDUCK])), duckFloor = dbToGain (-30.0f);
+    const float ligClassic = std::min (1.0f, dbToGain (-(depthDb + 6.0f + v[P_LDUCK])));
     float guiDuckSum = 0.0f;
     int guiDuckCount = 0;
     const float feed = v[P_FEED], spin = v[P_SPIN], forestBloom = v[P_FORESTBLOOM], echoFb = v[P_ECHOFB];
@@ -1967,55 +2134,46 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
     const float echoTime = std::min (2.5f * fsf, echoIdx == 0 ? 0.085f * fsf : kEchoBeats[echoIdx] * (float) (60.0 / hostBpm) * fsf);
     const float lig = v[P_LIGATURE];
     const bool ligOn = lig > 0.0005f;
-    const float ligFb = 0.2f + 0.5f * lig, ligOut = 0.9f * lig;
+    // Repeats: 0 = what the Ligature knob sets; + toward 97 % feedback, - toward none
+    const float ligBase = 0.2f + 0.5f * lig, ligRep = clampf (v[P_LREPEATS], -1.0f, 1.0f);
+    const float ligFb = ligRep > 0.0f ? ligBase + ligRep * (0.97f - ligBase) : ligBase + ligRep * ligBase;
+    const float ligOut = 0.9f * lig;
     const float beatS = (float) (60.0 / hostBpm) * fsf;
-    const float ligTLt = std::min (0.5f * beatS, 1.5f * fsf);    // 1/8
-    const float ligTRt = std::min (0.75f * beatS, 1.5f * fsf);   // dotted 1/8
+    static const float kLigBeats[12] = { 0.0f, 0.125f, 1.0f / 6.0f, 0.25f, 0.375f, 1.0f / 3.0f, 0.5f, 0.75f, 2.0f / 3.0f, 1.0f, 1.5f, 2.0f };
+    auto ligTime = [&] (int syncP, int msP)
+    {
+        const int s = std::min (std::max ((int) (v[syncP] + 0.5f), 0), 11);
+        return std::min (s == 0 ? 0.001f * v[msP] * fsf : kLigBeats[s] * beatS, 1.5f * fsf);
+    };
+    const float ligTLt = ligTime (P_LLEFT, P_LLEFTMS);     // 1/8 by default
+    const float ligTRt = ligTime (P_LRIGHT, P_LRIGHTMS);   // dotted 1/8 by default
     if (ligTL <= 0.0f) { ligTL = ligTLt; ligTR = ligTRt; }
-
-    // IMAGER: what the bands should be (the crossovers keep at least a third of an octave apart)
-    float imgGt[4], imgSpt[4];
-    bool imgWant = false, spreadWant = false;
-    for (int b = 0; b < 4; ++b)
+    // Drive of the repeats (the saturation in the loop), Tone of the repeats (the loop's low-pass / high-pass)
+    const float ligK = 1.5f * dbToGain (v[P_LDRIVE]), ligKInv = 1.0f / ligK;
     {
-        imgGt[b] = 1.0f + clampf (v[P_IW1 + b], -1.0f, 1.0f);
-        imgSpt[b] = clampf (v[P_IS1 + b], 0.0f, 1.0f);
-        if (std::fabs (imgGt[b] - 1.0f) > 1.0e-4f || imgSpt[b] > 1.0e-4f) imgWant = true;
-        if (imgSpt[b] > 1.0e-4f) spreadWant = true;
-    }
-    const float imgRect = clampf (v[P_IRECOVER], 0.0f, 1.0f);
-    const bool recWant = imgRect > 1.0e-4f && (imgGt[0] < 0.9999f || imgGt[1] < 0.9999f || imgGt[2] < 0.9999f || imgGt[3] < 0.9999f);
-    imgWant = imgWant && stereo;
-    // engage at once; let go only after a second at neutral (so automation passing through 0 does not flip it)
-    if (imgWant) imgQuiet = 0;
-    else if (imgQuiet < 1 << 20) imgQuiet += n;
-    const bool imgOn = imgWant || (imgLive && imgQuiet < (int) fsf);
-    if (imgOn || imgLive)
-    {
-        float xt[3] = { clampf (v[P_IX1], 20.0f, 0.4f * fsf), clampf (v[P_IX2], 20.0f, 0.4f * fsf), clampf (v[P_IX3], 20.0f, 0.4f * fsf) };
-        xt[1] = std::min (std::max (xt[1], xt[0] * 1.26f), 0.4f * fsf);
-        xt[2] = std::min (std::max (xt[2], xt[1] * 1.26f), 0.42f * fsf);
-        bool moved = imgX[0] < 0.0f;
-        for (int i = 0; i < 3; ++i)
+        const float tone = clampf (v[P_LTONE], -1.0f, 1.0f);
+        if (std::fabs (tone - ligToneCache) > 1.0e-6f)
         {
-            // glide (a fifth of the way per block), so a dragged crossover does not click
-            const float nx = imgX[i] < 0.0f ? xt[i] : imgX[i] * std::pow (xt[i] / imgX[i], 0.2f);
-            if (std::fabs (nx - imgX[i]) > 1.0e-3f * xt[i]) { imgX[i] = nx; moved = true; }
-        }
-        if (moved)
-        {
-            imgSplitS.design (imgX, fs); imgSplitD.design (imgX, fs);
-            imgSumS.design (imgX, fs); imgSumD.design (imgX, fs); imgSumR.design (imgX, fs);
-            for (int i = 0; i < 3; ++i)
+            ligToneCache = tone;
+            for (int c = 0; c < 2; ++c)
             {
-                imgApM[i].allpass (imgX[i], 0.70710678, fs);
-                imgApDry[0][i].allpass (imgX[i], 0.70710678, fs);
-                imgApDry[1][i].allpass (imgX[i], 0.70710678, fs);
+                ligLP[c].setCutoff (3500.0f * std::exp2 (1.9f * tone), fsf);
+                ligHP[c].setCutoff (180.0f * std::exp2 (1.8f * std::max (0.0f, tone)), fsf);
             }
         }
     }
-    guiImgOn.store (imgOn, std::memory_order_relaxed);
-    const bool imgMeter = imgMetering.load (std::memory_order_relaxed);
+    // Float: a slow pitch drift of the echo (the right side a quarter turn behind)
+    const float ligFloat = std::min (0.025f * fsf, fsf * v[P_LFLOAT] * 0.000578f / (kTwoPi * std::max (0.05f, v[P_LRATE])));
+    const float ligFloatInc = v[P_LRATE] / fsf;
+
+    // IMAGER: the doubles' (MAVKA's own sound) and the Ligature echo's, each with its own bands
+    if (imgLig.live && ! ligOn)
+        imgLig.clear();       // nothing flows through it now: let go at once
+    imgDbl.update (v, P_IX1, stereo, n, fs);
+    imgLig.update (v, P_LIX1, stereo && ligOn, n, fs);
+    guiImgOnD.store (imgDbl.on, std::memory_order_relaxed);
+    guiImgOnL.store (imgLig.on, std::memory_order_relaxed);
+    const int imgMeter = imgMetering.load (std::memory_order_relaxed);   // -1 none, 0 Ligature, 1 doubles
     int imgW = imgPos.load (std::memory_order_relaxed);
 
     float check = 0.0f;
@@ -2032,8 +2190,9 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
         float wv[2] = { 0.0f, 0.0f };
         float clipHitMono = 0.0f;
         const float voiceGate = clampf ((1.0f - duckBuf[j]) * (1.0f / 0.92f), 0.0f, 1.0f);
+        const float ligGate = clampf ((1.0f - ligDuckBuf[j]) * (1.0f / 0.92f), 0.0f, 1.0f);
         if (spectral)
-            duckKey.process (stereo ? 0.5f * (dryOut[0][j] + dryOut[1][j]) : dryOut[0][j], voiceGate);
+            duckKey.process (stereo ? 0.5f * (dryOut[0][j] + dryOut[1][j]) : dryOut[0][j], voiceGate, ligGate);
         for (int c = 0; c < numCh; ++c)
         {
             Chan& C = ch[c];
@@ -2074,31 +2233,63 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
             wv[c] = w * C.ctlRestore.tap (dly) * C.ctlFocus.tap (dly) * C.ctlInkWet.tap (dly);
         }
 
+        // IMAGER (doubles): the width of MAVKA's own sound, before the Ligature joins it. The dry takes the very
+        // same all-pass, so dry and wet never comb against each other.
+        float mPre[2] = { 0.0f, 0.0f }, mPost[2] = { 0.0f, 0.0f };   // what the imager's picture shows
+        float dryAp[2] = { dryOut[0][j], stereo ? dryOut[1][j] : 0.0f };
+        if (imgMeter == 1) { mPre[0] = wv[0]; mPre[1] = stereo ? wv[1] : wv[0]; }
+        if (stereo && (imgDbl.on || imgDbl.live))
+        {
+            imgDbl.step (wv[0], wv[1], aS, aImg);
+            imgDbl.allpassAlong (dryAp);
+            imgDbl.settle();
+        }
+        if (imgMeter == 1) { mPost[0] = wv[0]; mPost[1] = stereo ? wv[1] : wv[0]; }
+
         // Ligature: saturated ping-pong echo in time with the song, ducked while the voice sings
         if (ligOn)
         {
             ligTL += (ligTLt - ligTL) * aLigT;
             ligTR += (ligTRt - ligTR) * aLigT;
-            const float oL = ligL.read (ligTL);
-            const float oR = stereo ? ligR.read (ligTR) : 0.0f;
-            const float duck = (duckMode == 1 ? 1.0f - voiceGate * (1.0f - ligClassic) : 1.0f) * ligOut;
+            float rdL = ligTL, rdR = ligTR;
+            if (ligFloat > 0.0f)
+            {
+                ligPh += ligFloatInc;
+                ligPh -= std::floor (ligPh);
+                rdL = std::max (1.0f, ligTL + ligFloat * std::sin (kTwoPi * ligPh));
+                rdR = std::max (1.0f, ligTR - ligFloat * std::cos (kTwoPi * ligPh));
+            }
+            const float oL = ligL.read (rdL);
+            const float oR = stereo ? ligR.read (rdR) : 0.0f;
+            const float duck = (duckMode == 1 ? 1.0f - ligGate * (1.0f - ligClassic) : 1.0f) * ligOut;
             float rL = duck * oL, rR = stereo ? duck * oR : 0.0f;
             if (spectral)
-                duckLig.process (duckKey, rL, rR, ligMargin, duckFloor);   // keep (depth + 3) dB under the voice
+                duckLig.process (duckKey, rL, rR, ligMargin, duckFloor, true);   // keep (depth + 3) dB under the voice
+            // the door: what of each word goes into the echo (Skip: not its attack, Grab: mostly its attack)
+            const float inDoor = ctlLigDoor.tap (dly);
             if (stereo)
             {
-                const float fL = fastTanh (1.5f * ligHP[0].hp (ligLP[0].lp (oR))) * (1.0f / 1.5f);
-                const float fR = fastTanh (1.5f * ligHP[1].hp (ligLP[1].lp (oL))) * (1.0f / 1.5f);
-                ligL.push (wv[0] + ligFb * fL);
-                ligR.push (wv[1] + ligFb * fR);
+                const float fL = fastTanh (ligK * ligHP[0].hp (ligLP[0].lp (oR))) * ligKInv;
+                const float fR = fastTanh (ligK * ligHP[1].hp (ligLP[1].lp (oL))) * ligKInv;
+                ligL.push (wv[0] * inDoor + ligFb * fL);
+                ligR.push (wv[1] * inDoor + ligFb * fR);
+                // IMAGER (Ligature): the width of the echo in its own four bands
+                if (imgMeter == 0) { mPre[0] = rL; mPre[1] = rR; }
+                if (imgLig.on || imgLig.live)
+                {
+                    imgLig.step (rL, rR, aS, aImg);
+                    imgLig.settle();
+                }
+                if (imgMeter == 0) { mPost[0] = rL; mPost[1] = rR; }
                 wv[0] += rL;
                 wv[1] += rR;
             }
             else
             {
-                const float f = fastTanh (1.5f * ligHP[0].hp (ligLP[0].lp (oL))) * (1.0f / 1.5f);
-                ligL.push (wv[0] + ligFb * f);
+                const float f = fastTanh (ligK * ligHP[0].hp (ligLP[0].lp (oL))) * ligKInv;
+                ligL.push (wv[0] * inDoor + ligFb * f);
                 wv[0] += rL;
+                if (imgMeter == 0) { mPre[0] = mPre[1] = mPost[0] = mPost[1] = rL; }
             }
         }
 
@@ -2117,69 +2308,12 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
         }
         clipPeak = std::max (clipPeak, clipHitMono / (float) numCh);
 
-        // IMAGER: the width of the wet sound in four bands. Only the side changes; the mid (and the dry, below)
-        // pass through the same all-pass as the bands, so the mono sum is untouched and nothing smears.
-        float dryAp[2] = { dryOut[0][j], stereo ? dryOut[1][j] : 0.0f };
-        const float preL = wv[0], preR = stereo ? wv[1] : wv[0];
-        if (imgOn || imgLive)
+        if (imgMeter >= 0)
         {
-            if (! imgLive) { resetImager(); imgLive = true; }
-            imgMix += ((imgOn ? 1.0f : 0.0f) - imgMix) * aImg;
-            for (int b = 0; b < 4; ++b)
-            {
-                imgG[b] += (imgGt[b] - imgG[b]) * aS;
-                imgSp[b] += (imgSpt[b] - imgSp[b]) * aS;
-            }
-            imgRec += ((recWant ? imgRect : 0.0f) - imgRec) * aS;
-
-            const float m = 0.5f * (wv[0] + wv[1]), s = 0.5f * (wv[0] - wv[1]);
-            float bs[4];
-            imgSplitS.split (s, bs);
-            float s2 = imgSumS.sum (bs, imgG);
-
-            // SPREAD: a dispersed copy of the mid goes into the side of its band - width for what has none
-            const bool spreadOn = spreadWant || imgSp[0] + imgSp[1] + imgSp[2] + imgSp[3] > 1.0e-5f;
-            if (spreadOn)
-            {
-                if (! imgSpreadLive) { imgSpread.reset(); imgSplitD.reset(); imgSumD.reset(); imgSpreadLive = true; }
-                float bd[4];
-                imgSplitD.split (imgSpread.process (m), bd);
-                s2 += 0.7f * imgSumD.sum (bd, imgSp);
-            }
-            else imgSpreadLive = false;
-
-            float m2 = imgApM[2].process (imgApM[1].process (imgApM[0].process (m)));
-
-            // RECOVER: what narrowing takes out of the side comes back in the middle (dispersed, so it adds body
-            // instead of combing with the mid)
-            if (recWant || imgRec > 1.0e-5f)
-            {
-                if (! imgRecLive) { imgRecover.reset(); imgSumR.reset(); imgRecLive = true; }
-                const float rg[4] = { std::max (0.0f, 1.0f - imgG[0]), std::max (0.0f, 1.0f - imgG[1]),
-                                      std::max (0.0f, 1.0f - imgG[2]), std::max (0.0f, 1.0f - imgG[3]) };
-                m2 += imgRec * 0.7f * imgRecover.process (imgSumR.sum (bs, rg));
-            }
-            else imgRecLive = false;
-
-            wv[0] += imgMix * (m2 + s2 - wv[0]);
-            wv[1] += imgMix * (m2 - s2 - wv[1]);
-            for (int c = 0; c < 2; ++c)
-            {
-                const float a = imgApDry[c][2].process (imgApDry[c][1].process (imgApDry[c][0].process (dryAp[c])));
-                dryAp[c] += imgMix * (a - dryAp[c]);
-            }
-            if (! imgOn && imgMix < 1.0e-4f)
-            {
-                resetImager();
-                imgMix = 0.0f;
-            }
-        }
-        if (imgMeter)
-        {
-            imgPreL[imgW].store (preL, std::memory_order_relaxed);
-            imgPreR[imgW].store (preR, std::memory_order_relaxed);
-            imgPostL[imgW].store (wv[0], std::memory_order_relaxed);
-            imgPostR[imgW].store (stereo ? wv[1] : wv[0], std::memory_order_relaxed);
+            imgPreL[imgW].store (mPre[0], std::memory_order_relaxed);
+            imgPreR[imgW].store (mPre[1], std::memory_order_relaxed);
+            imgPostL[imgW].store (mPost[0], std::memory_order_relaxed);
+            imgPostR[imgW].store (mPost[1], std::memory_order_relaxed);
             imgW = (imgW + 1) & (kImg - 1);
         }
 
@@ -2288,7 +2422,7 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
         }
     }
 
-    if (imgMeter)
+    if (imgMeter >= 0)
         imgPos.store (imgW, std::memory_order_release);
     if (clipPeak > guiClip.load (std::memory_order_relaxed))
         guiClip.store (clipPeak, std::memory_order_relaxed);

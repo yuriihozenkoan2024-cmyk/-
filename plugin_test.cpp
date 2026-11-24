@@ -108,8 +108,12 @@ int main (int argc, char** argv)
     for (int k = 0; k < mavka::P_COUNT; ++k)
     {
         const char* id = mavka::paramDefs()[k].id;
-        if (std::abs (p.apvts.getRawParameterValue (id)->load() - p2.apvts.getRawParameterValue (id)->load()) > 1.0e-5f)
+        const float a = p.apvts.getRawParameterValue (id)->load(), b = p2.apvts.getRawParameterValue (id)->load();
+        if (std::abs (a - b) > 1.0e-5f * (1.0f + std::abs (a)))
+        {
+            std::printf ("    %s: %.7g -> %.7g\n", id, (double) a, (double) b);
             same = false;
+        }
     }
     check (same && p2.getFactoryPresetIndex() == 6, "state save / load round trip (incl. preset name)");
 
@@ -155,6 +159,10 @@ int main (int argc, char** argv)
                "Detune accepts 447 / 432.0 Hz / -12.5 ct");
         check (det->getText (det->convertTo0to1 (c447), 32) == "447.0 Hz", "Detune shows 447.0 Hz back");
         auto txt = [&] (const char* id) { auto* q = p.apvts.getParameter (id); return q->getText (q->getDefaultValue(), 32); };
+        check (txt ("ligLeft") == "1/8" && txt ("ligRight") == "1/8." && txt ("ligRepeats") == "0%" && txt ("ligTone") == "Neutral"
+               && txt ("ligAttack") == "Natural" && txt ("ligSoft") == "4.0 ms" && txt ("ligReturn") == "140 ms"
+               && txt ("ligDrive") == "0.0 dB" && txt ("ligImgX2") == "1.2 kHz" && txt ("ligImgW1") == "0%",
+               "the Ligature's fine controls exist with the earlier sound as their defaults");
         check (txt ("glassTime") == "23.0 ms" && txt ("foldTime") == "37.0 ms" && txt ("glassSync") == "Free"
                && txt ("glassTone") == "Neutral" && txt ("foldAttack") == "Natural" && txt ("glassRate") == "0.70 Hz"
                && txt ("imgX1") == "180 Hz" && txt ("imgX2") == "1.2 kHz" && txt ("imgW3") == "0%",
@@ -235,9 +243,14 @@ int main (int argc, char** argv)
                               && typeInto ("glassAttack", "Skip 60", -0.6f) && typeInto ("foldAttack", "grab 25%", 0.25f)
                               && typeInto ("glassTone", "dark 30", -0.3f) && typeInto ("glassRate", "0.25 Hz", 0.25f)
                               && typeInto ("imgX1", "250 Hz", 250.0f) && typeInto ("imgX3", "7.5k", 7500.0f)
-                              && typeInto ("imgW2", "-40%", -0.4f) && typeInto ("imgS4", "35%", 0.35f);
-            check (fine, "DOUBLES / IMAGER knobs take typed values (80 ms, Skip 60, dark 30, 250 Hz, 7.5k, -40%...)");
-            for (auto* id : { "glassTime", "foldTime", "glassAttack", "foldAttack", "glassTone", "glassRate", "imgX1", "imgX3", "imgW2", "imgS4" })
+                              && typeInto ("imgW2", "-40%", -0.4f) && typeInto ("imgS4", "35%", 0.35f)
+                              && typeInto ("ligLeftMs", "300 ms", 300.0f) && typeInto ("ligRepeats", "+40%", 0.4f)
+                              && typeInto ("ligAttack", "skip 50", -0.5f) && typeInto ("ligDuck", "-6", -6.0f)
+                              && typeInto ("ligTone", "bright 20", 0.2f) && typeInto ("ligReturn", "60", 60.0f)
+                              && typeInto ("ligImgW4", "+70%", 0.7f) && typeInto ("ligImgX1", "220 Hz", 220.0f);
+            check (fine, "LIGATURE / DOUBLES / IMAGER knobs take typed values (300 ms, Skip 50, dark 30, 250 Hz, 7.5k, -40%...)");
+            for (auto* id : { "glassTime", "foldTime", "glassAttack", "foldAttack", "glassTone", "glassRate", "imgX1", "imgX3", "imgW2", "imgS4",
+                              "ligLeftMs", "ligRepeats", "ligAttack", "ligDuck", "ligTone", "ligReturn", "ligImgW4", "ligImgX1" })
                 if (auto* prm = p.apvts.getParameter (id))
                     prm->setValueNotifyingHost (prm->getDefaultValue());
         }
@@ -265,6 +278,8 @@ int main (int argc, char** argv)
                 auto set = [&] (const char* id, float v) { if (auto* prm = p.apvts.getParameter (id)) prm->setValueNotifyingHost (prm->convertTo0to1 (v)); };
                 set ("glassRepeats", 0.35f); set ("glassSync", 4.0f); set ("glassFloat", 12.0f); set ("foldAttack", -0.6f);
                 set ("imgW1", -0.8f); set ("imgW3", 0.4f); set ("imgW4", 0.9f); set ("imgS2", 0.4f); set ("imgRecover", 0.5f);
+                set ("ligature", 0.45f); set ("ligRepeats", 0.3f); set ("ligTone", -0.3f); set ("ligFloat", 10.0f);
+                set ("ligImgW1", -1.0f); set ("ligImgW2", -0.4f); set ("ligImgW4", 0.8f); set ("ligImgS3", 0.5f);
                 editor.selectPage (7);
             }
             for (int c = 0; c < 2; ++c)
@@ -307,8 +322,29 @@ int main (int argc, char** argv)
         snap ("large_6");
         editor.selectPage (7);
         snap ("large_7");
-        check (ok, "editor renders all eight pages to images (small, base and large size)");
-        check (p.engine.isImagerActive(), "the imager is engaged once a band is moved");
+        editor.selectPage (8);
+        snap ("large_8");
+        check (ok, "editor renders all nine pages to images (small, base and large size)");
+        check (p.engine.isImagerActive (0) && p.engine.isImagerActive (1), "both imagers (Ligature, doubles) engage once a band moves");
+        {
+            // the doubles' imager on the IMAGER tab, after a moment of audio
+            editor.selectPage (7);
+            editor.pickImager (1);
+            for (int t = 0; t < 40; ++t)
+            {
+                for (int c = 0; c < 2; ++c)
+                    for (int i = 0; i < 1600; ++i)
+                    {
+                        const int idx = (ticks + 60 + t) * 1600 + i;
+                        buf.setSample (c, i, voice.getNumSamples() > idx ? voice.getSample (juce::jmin (c, voice.getNumChannels() - 1), idx)
+                                                                         : 0.1f * (float) std::sin (idx * 0.02));
+                    }
+                p.processBlock (buf, midi);
+                editor.refreshDisplays();
+            }
+            snap ("large_7_doubles");
+            editor.pickImager (0);
+        }
 
         // a 2x (4K / Retina) screen at the largest size: the textures follow the real pixel density
         {

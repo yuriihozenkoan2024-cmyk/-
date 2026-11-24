@@ -1182,6 +1182,225 @@ static int testImager()
 }
 
 //==============================================================================
+// LIGATURE: the ping-pong echo between the words, finely
+static double shortBand (const std::vector<float>& x, size_t start, size_t N, double sr, double f1, double f2)
+{
+    std::vector<double> w (N);
+    for (size_t i = 0; i < N; ++i) w[i] = (start + i < x.size() ? x[start + i] : 0.0f) * (0.5 - 0.5 * std::cos (2 * kPiD * i / (N - 1)));
+    std::vector<double> mag; fftMag (w, mag);
+    double p = 0.0;
+    for (size_t k = (size_t) (f1 / sr * N); k <= (size_t) (f2 / sr * N) && k < mag.size(); ++k) p += mag[k];
+    return p + 1.0e-30;
+}
+
+static int testLigature()
+{
+    const double sr = 48000.0, bpm = 120.0;
+    bool ok = true;
+    auto ligParams = [] (float* v) { linearParams (v); v[P_LIGATURE] = 0.5f; v[P_AUTOGAIN] = 0.0f; };
+    auto db = [] (double a, double b) { return 10.0 * std::log10 (a / b); };
+
+    // a short 1 kHz burst alone in the silence: where the left and the right echo come back
+    std::vector<float> burst ((size_t) (0.004 * sr));
+    for (size_t i = 0; i < burst.size(); ++i)
+        burst[i] = (float) (0.25 * std::sin (2 * kPiD * 1000.0 * i / sr) * (0.5 - 0.5 * std::cos (2 * kPiD * i / (burst.size() - 1))));
+    const size_t at = (size_t) (0.2 * sr);
+    std::vector<std::vector<float>> in (2, std::vector<float> ((size_t) (1.6 * sr), 0.0f));
+    for (auto& c : in) std::copy (burst.begin(), burst.end(), c.begin() + (long) at);
+    auto firstEcho = [&] (const std::vector<float>& y)
+    {
+        const size_t from = at + (size_t) (0.08 * sr);
+        const auto e = burstEchoes (y, burst, from, sr, 1, 20.0);
+        return e.empty() ? -1.0 : e[0] + 80.0;
+    };
+    {
+        float v[P_COUNT]; ligParams (v);
+        auto a = renderAligned (v, in, sr, bpm);
+        v[P_LLEFT] = 0.0f; v[P_LLEFTMS] = 180.0f; v[P_LRIGHT] = 0.0f; v[P_LRIGHTMS] = 270.0f;
+        auto b = renderAligned (v, in, sr, bpm);
+        v[P_LLEFT] = 9.0f; v[P_LRIGHT] = 3.0f;   // 1/4 and 1/16
+        auto c = renderAligned (v, in, sr, bpm);
+        const double aL = firstEcho (a[0]), aR = firstEcho (a[1]), bL = firstEcho (b[0]), bR = firstEcho (b[1]);
+        const double cL = firstEcho (c[0]), cR = firstEcho (c[1]);
+        std::printf ("  Time: default %.1f / %.1f ms (1/8 / dotted 1/8 at 120 bpm = 250 / 375), Free 180 / 270 ms: %.1f / %.1f, "
+                     "1/4 / 1/16: %.1f / %.1f ms\n", aL, aR, bL, bR, cL, cR);
+        ok = ok && std::fabs (aL - 250.0) < 1.5 && std::fabs (aR - 375.0) < 1.5 && std::fabs (bL - 180.0) < 1.5
+                && std::fabs (bR - 270.0) < 1.5 && std::fabs (cL - 500.0) < 1.5 && std::fabs (cR - 125.0) < 1.5;
+    }
+    {
+        // REPEATS: the second left echo (it came back through the right side) against the first
+        auto ratio = [&] (float rep)
+        {
+            float v[P_COUNT]; ligParams (v); v[P_DUCK] = 2.0f; v[P_LREPEATS] = rep;
+            auto y = renderAligned (v, in, sr, bpm);
+            const auto e = burstEchoes (y[0], burst, at + (size_t) (0.08 * sr), sr, 2, 60.0);
+            if (e.size() < 4) return 0.0;
+            return e[0] < e[2] ? e[3] / e[1] : e[1] / e[3];
+        };
+        const double r0 = ratio (0.0f), rUp = ratio (0.8f), rDn = ratio (-0.8f);
+        std::printf ("  Repeats: each repeat %.2f of the one before at 0 (the Ligature knob's own), %.2f at +80%%, %.2f at -80%%\n",
+                     r0, rUp, rDn);
+        ok = ok && r0 > 0.3 && r0 < 0.5 && rUp > 0.7 && rUp < 0.95 && rDn < 0.12;
+    }
+    {
+        // TONE and DRIVE of the repeats (the first echo is the voice itself; the second has been through the loop)
+        std::vector<std::vector<float>> nz (2, std::vector<float> ((size_t) (1.6 * sr), 0.0f));
+        std::mt19937 rng (7); std::normal_distribution<float> G (0.0f, 0.1f);
+        for (size_t i = 0; i < (size_t) (0.03 * sr); ++i) { const float x = G (rng); nz[0][at + i] = x; nz[1][at + i] = x; }
+        auto tilt = [&] (float tone)
+        {
+            float v[P_COUNT]; ligParams (v); v[P_DUCK] = 2.0f; v[P_LTONE] = tone;
+            auto y = renderAligned (v, nz, sr, bpm);
+            const size_t e1 = at + (size_t) (0.245 * sr), e2 = at + (size_t) (0.620 * sr);
+            return db (shortBand (y[0], e2, 4096, sr, 4000.0, 8000.0), shortBand (y[0], e2, 4096, sr, 200.0, 400.0))
+                 - db (shortBand (y[0], e1, 4096, sr, 4000.0, 8000.0), shortBand (y[0], e1, 4096, sr, 200.0, 400.0));
+        };
+        const double t0 = tilt (0.0f), tD = tilt (-1.0f), tB = tilt (1.0f);
+        std::printf ("  Tone: a repeat's top vs its bottom, against the first echo: %+.1f dB neutral, %+.1f dark, %+.1f bright\n", t0, tD, tB);
+        ok = ok && tD < t0 - 6.0 && tB > t0 + 6.0;
+
+        std::vector<std::vector<float>> sn (2, std::vector<float> ((size_t) (1.6 * sr), 0.0f));
+        for (size_t i = 0; i < (size_t) (0.06 * sr); ++i)
+        {
+            const float x = (float) (0.5 * std::sin (2 * kPiD * 1000.0 * i / sr) * std::min (1.0, std::min (i, (size_t) (0.06 * sr) - i) / (0.005 * sr)));
+            sn[0][at + i] = x; sn[1][at + i] = x;
+        }
+        auto thd = [&] (float d)
+        {
+            float v[P_COUNT]; ligParams (v); v[P_DUCK] = 2.0f; v[P_LDRIVE] = d;
+            auto y = renderAligned (v, sn, sr, bpm);
+            const size_t e2 = at + (size_t) (0.625 * sr);
+            return db (shortBand (y[0], e2, 2048, sr, 2500.0, 6500.0), shortBand (y[0], e2, 2048, sr, 900.0, 1100.0));
+        };
+        const double d0 = thd (0.0f), dHi = thd (18.0f), dLo = thd (-12.0f);
+        std::printf ("  Drive: harmonics of a repeat %+.1f dB at -12 dB, %+.1f at 0, %+.1f at +18 dB\n", dLo, d0, dHi);
+        ok = ok && dHi > d0 + 6.0 && dLo < d0 + 0.5;   // below 0 dB the repeats are as clean as the voice itself
+    }
+    {
+        // FLOAT: the echo of a held note floats around its pitch
+        std::vector<std::vector<float>> tn (2, std::vector<float> ((size_t) (1.2 * sr), 0.0f));
+        for (size_t i = 0; i < (size_t) (0.5 * sr); ++i) { const float x = (float) (0.2 * std::sin (2 * kPiD * 440.0 * i / sr)); tn[0][i] = x; tn[1][i] = x; }
+        auto span = [&] (float cents)
+        {
+            float v[P_COUNT]; ligParams (v); v[P_DUCK] = 2.0f; v[P_LFLOAT] = cents; v[P_LRATE] = 8.0f;
+            auto y = renderAligned (v, tn, sr, bpm);
+            return pitchSpanCents (y[0], (size_t) (0.56 * sr), (size_t) (0.74 * sr), sr, 440.0);
+        };
+        const double s0 = span (0.0f), s30 = span (30.0f);
+        std::printf ("  Float 30 ct at 8 Hz: the echo's pitch swings %.1f ct (%.1f ct without)\n", s30, s0);
+        ok = ok && s0 < 5.0 && s30 > 35.0 && s30 < 80.0;
+    }
+    {
+        // ATTACK: what of each word goes into the echo (the duck off, to see only the door)
+        std::vector<std::vector<float>> w (2, std::vector<float> ((size_t) (2.6 * sr), 0.0f));
+        for (int k = 0; k < 3; ++k)
+            for (size_t i = 0; i < (size_t) (0.2 * sr); ++i)
+            {
+                const double t = (double) i / sr;
+                double x = 0.0;
+                for (int h = 1; h <= 8; ++h) x += std::sin (2 * kPiD * 220.0 * h * t) / h;
+                const float y = (float) (0.2 * x * std::min (1.0, t / 0.002) * std::min (1.0, (0.2 - t) / 0.01));
+                w[0][(size_t) ((0.2 + 0.8 * k) * sr) + i] = y; w[1][(size_t) ((0.2 + 0.8 * k) * sr) + i] = y;
+            }
+        auto early = [&] (float att)
+        {
+            float v[P_COUNT]; ligParams (v); v[P_DUCK] = 2.0f; v[P_LATTACK] = att; v[P_LOPEN] = 80.0f;
+            auto y = renderAligned (v, w, sr, bpm);
+            double e = 0.0, l = 0.0;
+            for (int k = 1; k < 3; ++k)
+            {
+                const size_t on = (size_t) ((0.2 + 0.8 * k + 0.25) * sr);
+                for (size_t i = 0; i < (size_t) (0.025 * sr); ++i) e += y[0][on + i] * y[0][on + i];
+                for (size_t i = (size_t) (0.15 * sr); i < (size_t) (0.175 * sr); ++i) l += y[0][on + i] * y[0][on + i];
+            }
+            return 10.0 * std::log10 ((e + 1e-30) / (l + 1e-30));
+        };
+        const double a0 = early (0.0f), aS = early (-1.0f), aG = early (1.0f);
+        std::printf ("  Attack: the echo's first 25 ms vs its body: %+.1f dB natural, %+.1f Skip 100%%, %+.1f Grab 100%%\n", a0, aS, aG);
+        ok = ok && aS < a0 - 8.0 && aG > a0 + 4.0;
+    }
+    {
+        // DUCK / SOFT / RETURN (classic duck): one note, then another; the echo of the first plays under the second
+        std::vector<std::vector<float>> two (2, std::vector<float> ((size_t) (2.4 * sr), 0.0f));
+        for (size_t i = 0; i < (size_t) (2.0 * sr); ++i)
+        {
+            const double t = (double) i / sr, f = t < 1.0 ? 300.0 : 700.0;
+            const float x = (float) (0.2 * std::sin (2 * kPiD * f * t));
+            two[0][i] = x; two[1][i] = x;
+        }
+        auto under = [&] (float duckDb, float soft, float ret, double from, double f1, double f2)
+        {
+            float v[P_COUNT]; ligParams (v); v[P_DUCK] = 1.0f; v[P_LDUCK] = duckDb; v[P_LSOFT] = soft; v[P_LRETURN] = ret;
+            auto y = renderAligned (v, two, sr, bpm);
+            return 10.0 * std::log10 (shortBand (y[0], (size_t) (from * sr), 4096, sr, f1, f2));
+        };
+        // the echo of the 300 Hz note under the 700 Hz one (1.06 - 1.14 s)
+        const double u0 = under (0.0f, 4.0f, 140.0f, 1.06, 270.0, 330.0), uShallow = under (-24.0f, 4.0f, 140.0f, 1.06, 270.0, 330.0),
+                     uDeep = under (12.0f, 4.0f, 140.0f, 1.06, 270.0, 330.0);
+        std::printf ("  Duck: the echo under the voice %+.1f dB at 0, %+.1f at -24 dB (barely ducks), %+.1f at +12 dB (deeper)\n",
+                     u0 - u0, uShallow - u0, uDeep - u0);
+        ok = ok && uShallow > u0 + 12.0 && uDeep < u0 - 6.0;
+        // RETURN: after the voice stops (2.0 s), how fast the echo of its last note comes back
+        const double rFast = under (0.0f, 4.0f, 20.0f, 2.12, 670.0, 730.0), rSlow = under (0.0f, 4.0f, 1500.0f, 2.12, 670.0, 730.0);
+        // SOFT: a word, a pause, and the next word comes in while the echo (a quarter note) of the first still plays;
+        // a soft duck lets the echo fade under the new word instead of vanishing at once
+        std::vector<std::vector<float>> gap (2, std::vector<float> ((size_t) (1.6 * sr), 0.0f));
+        for (size_t i = 0; i < (size_t) (1.2 * sr); ++i)
+        {
+            const double t = (double) i / sr;
+            if (t >= 0.4 && t < 0.6) continue;
+            const float x = (float) (0.2 * std::sin (2 * kPiD * (t < 0.4 ? 300.0 : 700.0) * t));
+            gap[0][i] = x; gap[1][i] = x;
+        }
+        auto echoAtOnset = [&] (float soft)
+        {
+            float v[P_COUNT]; ligParams (v); v[P_DUCK] = 1.0f; v[P_LSOFT] = soft; v[P_LLEFT] = 9.0f;   // 1/4: the echo plays 0.5 - 0.9 s
+            auto y = renderAligned (v, gap, sr, bpm);
+            return 10.0 * std::log10 (shortBand (y[0], (size_t) (0.62 * sr), 4096, sr, 270.0, 330.0));
+        };
+        const double sHard = echoAtOnset (4.0f), sSoft = echoAtOnset (200.0f);
+        std::printf ("  Soft 200 ms: the echo stays %+.1f dB louder as the voice comes in; Return 20 ms: the echo is back %+.1f dB "
+                     "sooner than at 1500 ms\n", sSoft - sHard, rFast - rSlow);
+        ok = ok && sSoft > sHard + 6.0 && rFast > rSlow + 8.0;
+    }
+    {
+        // the IMAGER aimed at the Ligature: the echo goes mono, the doubles keep their width
+        std::vector<std::vector<float>> w (2, std::vector<float> ((size_t) (3.0 * sr), 0.0f));
+        for (int k = 0; k < 3; ++k)
+            for (size_t i = 0; i < (size_t) (0.3 * sr); ++i)
+            {
+                const double t = (double) i / sr;
+                double x = 0.0;
+                for (int h = 1; h <= 10; ++h) x += std::sin (2 * kPiD * 196.0 * h * t) / h;
+                const float y = (float) (0.15 * x * std::min (1.0, t / 0.005) * std::min (1.0, (0.3 - t) / 0.02));
+                w[0][(size_t) ((0.2 + 0.9 * k) * sr) + i] = y; w[1][(size_t) ((0.2 + 0.9 * k) * sr) + i] = y;
+            }
+        float v[P_COUNT]; ligParams (v); v[P_LIGATURE] = 0.6f; v[P_GLASS] = 0.8f; v[P_WIDTH] = 0.8f; v[P_DUCK] = 2.0f;
+        const auto off = renderAligned (v, w, sr, bpm);
+        for (int b = 0; b < 4; ++b) v[P_LIW1 + b] = -1.0f;
+        const auto lig = renderAligned (v, w, sr, bpm);
+        for (int b = 0; b < 4; ++b) { v[P_LIW1 + b] = 0.0f; v[P_IW1 + b] = -1.0f; }
+        const auto all = renderAligned (v, w, sr, bpm);
+        auto sideIn = [&] (const std::vector<std::vector<float>>& y, double t0, double t1)
+        {
+            double s = 0.0;
+            for (size_t i = (size_t) (t0 * sr); i < (size_t) (t1 * sr); ++i) { const double d = 0.5 * (y[0][i] - y[1][i]); s += d * d; }
+            return s + 1e-30;
+        };
+        // the first word before any echo (0.25 - 0.42 s: the voice and its doubles) and a pause (1.55 - 1.95 s: only the echo)
+        const double wordLig = db (sideIn (lig, 0.25, 0.42), sideIn (off, 0.25, 0.42)), pauseLig = db (sideIn (lig, 1.55, 1.95), sideIn (off, 1.55, 1.95));
+        const double wordAll = db (sideIn (all, 0.25, 0.42), sideIn (off, 0.25, 0.42));
+        const double pauseAll = db (sideIn (all, 1.55, 1.95), sideIn (off, 1.55, 1.95));
+        std::printf ("  The Ligature's imager, every band at mono: the echo's side %+.1f dB, the word's side (the doubles) %+.2f dB;\n"
+                     "  the doubles' imager at mono: the word's side %+.1f dB, the echo's side %+.1f dB (it narrows only what echoes "
+                     "the doubles)\n", pauseLig, wordLig, wordAll, pauseAll);
+        ok = ok && pauseLig < -30.0 && std::fabs (wordLig) < 0.5 && wordAll < -30.0;
+    }
+    std::printf (ok ? "LIGATURE: OK (times, repeats, tone, drive, float, attack, duck, soft, return, its own width)\n" : "LIGATURE: CHECK\n");
+    return ok ? 0 : 1;
+}
+
+//==============================================================================
 static int findPreset (const std::string& s)
 {
     int count = 0; const Preset* p = factoryPresets (count);
@@ -1318,6 +1537,7 @@ int main (int argc, char** argv)
     if (cmd == "tuning") return testTuning();
     if (cmd == "doubles") return testDoubles();
     if (cmd == "imager") return testImager();
+    if (cmd == "ligature") return testLigature();
     double bpm = 95.0; std::vector<std::string> sets;
     std::vector<std::string> pos;
     for (int i = 2; i < argc; ++i)

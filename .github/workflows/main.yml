@@ -59,6 +59,7 @@ jobs:
           "$T" tuning
           "$T" doubles
           "$T" imager
+          "$T" ligature
 
       - name: Collect plugin files
         shell: bash

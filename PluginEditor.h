@@ -264,6 +264,8 @@ class ImagerField final : public juce::Component, public juce::SettableTooltipCl
 public:
     explicit ImagerField (juce::AudioProcessorValueTreeState& state) : apvts (state) {}
     static constexpr int kRows = 52;
+    // which imager it shows and edits: "ligImg" (the Ligature echo) or "img" (the doubles)
+    void setPrefix (const juce::String& p, bool ligature) { prefix = p; forLigature = ligature; hasData = false; repaint(); }
     void setData (const float* preL, const float* preR, const float* postL, const float* postR, int n,
                   double sampleRate, bool imagerActive, bool stereoTrack);
     void paint (juce::Graphics&) override;
@@ -297,7 +299,8 @@ private:
     std::vector<std::complex<float>> spec[4];
     std::vector<float> window;
     float peakDb = -150.0f;
-    bool active = false, stereo = true, hasData = false;
+    bool active = false, stereo = true, hasData = false, forLigature = true;
+    juce::String prefix { "ligImg" };
     int hover = -1, drag = -1;
     float dragFrom = 0.0f, dragX = 0.0f, dragY = 0.0f;
 };
@@ -354,9 +357,10 @@ public:
     void resized() override;
     void refreshDisplays() { timerCallback(); }
     void selectPage (int index);
+    void pickImager (int which);              // the IMAGER tab: 0 the Ligature echo's, 1 the doubles'
     void updateTextures (bool synchronous);   // match the texture resolution to the screen (sync: for tests)
     float getTextureLevel() const noexcept { return texLevel; }
-    static constexpr int numPages = 8;
+    static constexpr int numPages = 9;
 
 private:
     void timerCallback() override;
@@ -388,6 +392,10 @@ private:
     mavkaui::ClipScope clipScope;
     mavkaui::OvertoneMap overtoneMap { proc.apvts };
     mavkaui::ImagerField imagerField { proc.apvts };
+    int imagerWhich = 0;                       // the IMAGER tab shows the Ligature's (0) or the doubles' (1) imager
+    juce::TextButton imgPick[2];
+    std::vector<mavkaui::Knob*> imgKnobs[2];
+    mavkaui::Knob* syncedMs[4] {};             // Left / Right ms (Ligature), Glass / Fold Time: faint when on the beat
     int currentPage = 0;
     std::vector<float> scopeIn, scopeOut, imgBuf[4];
     std::array<juce::TextButton, numPages> tabs;
