@@ -35,6 +35,10 @@ struct InnerControls
     float crushRate, crushStep, crushMix;   // crusher: hold rate (Hz), quantiser step, blend
     float crushSync;                        // 1 = a new period of the voice starts here: restart the step grid
     float clipPos;                          // positive ceiling (lower on vowels = asymmetric, warm)
+    // THE DOUBLES, finely: each double hears its own line - the voice plus its own repeats, through its Tone
+    float fbG, fbF;                         // Repeats: loop gain (< 1)
+    float toneG, toneF;                     // Tone: -1 dark .. 0 untouched .. +1 bright (what the double hears)
+    float dDopF;                            // Fold's own Doppler throw (ms)
     // MELODIC DISTORTION: everything the core adds (crusher, the three machines, the clip) is measured against
     // the clean voice and split by the voice's overtones; each overtone the distortion adds is then kept, raised
     // or taken back (Sing for the notes of the song's chord, Dirt for the rest, plus the overtone map)
@@ -143,6 +147,60 @@ namespace inkey
     };
 }
 
+// IMAGER: a Linkwitz-Riley (24 dB / octave) split into four bands at three crossovers
+struct ImgSplit
+{
+    Biquad lp[3][2], hp[3][2];
+    void design (const float* x, double fs) noexcept
+    {
+        for (int i = 0; i < 3; ++i)
+            for (int k = 0; k < 2; ++k)
+            {
+                lp[i][k].lowpass (x[i], 0.70710678, fs);
+                hp[i][k].highpass (x[i], 0.70710678, fs);
+            }
+    }
+    void reset() noexcept
+    {
+        for (auto& r : lp) for (auto& b : r) b.reset();
+        for (auto& r : hp) for (auto& b : r) b.reset();
+    }
+    inline void split (float x, float* b) noexcept
+    {
+        b[0] = lp[0][1].process (lp[0][0].process (x));
+        const float r1 = hp[0][1].process (hp[0][0].process (x));
+        b[1] = lp[1][1].process (lp[1][0].process (r1));
+        const float r2 = hp[1][1].process (hp[1][0].process (r1));
+        b[2] = lp[2][1].process (lp[2][0].process (r2));
+        b[3] = hp[2][1].process (hp[2][0].process (r2));
+    }
+};
+
+// ... and the bands summed back with their own gains, through the all-passes of the crossovers a band did not
+// pass through: with every gain at 1 the sum is exactly one all-pass of the input (only phase, the same for all)
+struct ImgSum
+{
+    Biquad ap[2];
+    void design (const float* x, double fs) noexcept { ap[0].allpass (x[1], 0.70710678, fs); ap[1].allpass (x[2], 0.70710678, fs); }
+    void reset() noexcept { ap[0].reset(); ap[1].reset(); }
+    inline float sum (const float* b, const float* g) noexcept
+    {
+        const float lo = ap[0].process (g[0] * b[0]) + g[1] * b[1];
+        return ap[1].process (lo) + g[2] * b[2] + g[3] * b[3];
+    }
+};
+
+// IMAGER: a phase-dispersion decorrelator - a chain of all-passes, no echoes and no ringing: every frequency
+// turns by its own angle, so it is a copy of the sound that does not line up with it
+struct ImgDisperse
+{
+    static constexpr int kN = 6;
+    Biquad ap[kN];
+    void design (const float* f, double fs) noexcept { for (int i = 0; i < kN; ++i) ap[i].allpass (f[i], 0.6, fs); }
+    void reset() noexcept { for (auto& b : ap) b.reset(); }
+    inline float process (float x) noexcept { for (auto& b : ap) x = b.process (x); return x; }
+};
+
 // what the core added, for the GUI (filled by the active path's left channel)
 struct CoreMonitor
 {
@@ -174,10 +232,29 @@ inline float shapeClip (float v, float in, float h, float out) noexcept
     return ((1.0f - h) * fastTanh (u) + h * kneeClip (u)) * out;
 }
 
+// THE DOUBLES' Tone: a one-pole low-pass (dark) or high-pass (bright) on what a double hears
+struct DoubleTone
+{
+    float lp = 0.0f, hp = 0.0f;
+    float process (float x, float aLp, float aHp) noexcept
+    {
+        lp += aLp * (x - lp);
+        hp += aHp * (lp - hp);
+        return lp - hp;
+    }
+    void reset() noexcept { lp = hp = 0.0f; }
+};
+
 struct InnerState
 {
-    DelayLine dl, cl;          // the core's input after the crusher / the clean input (the reference)
-    OnePole dopLP;
+    DelayLine dl, cl;          // the lamp: the core's input after the crusher / the clean input (its reference)
+    // the doubles: what each one hears (the voice + its own repeats, through its Tone) and the same clean
+    // (no crusher, no ghosts: their references for the melodic distortion)
+    DelayLine gw, fw, gc, fc;
+    DoubleTone tG, tF, tGc, tFc;
+    float gPrev = 0.0f, fPrev = 0.0f, gcPrev = 0.0f, fcPrev = 0.0f;
+    float lastToneG = 9.0f, lastToneF = 9.0f, aLpG = 1.0f, aHpG = 0.0f, aLpF = 1.0f, aHpF = 0.0f;
+    OnePole dopLP, dopLPf;
     float crushPhase = 0.0f, crushHold = 0.0f;
     // MELODIC DISTORTION: state-variable band-passes on every overtone, tuned to the voice
     static constexpr int kB = InnerControls::kBands;
@@ -185,14 +262,28 @@ struct InnerState
     float hF0 = -1.0f, hRamp = 0.0f;
     bool hLive = false;
     // running least-squares fits: the linear gain of every machine against its clean input, and of the clip
-    float fMC[3] {}, fCC[3] {}, fYU = 0.0f, fUU = 0.0f, fDG = -1.0f;
+    float fMC[3] {}, fCC[3] {}, fYU = 0.0f, fUU = 0.0f, fDG = -1.0f, fDF = -1.0f;
+
+    static constexpr float kMaxDoubleSec = 0.33f;   // Time up to 300 ms, plus the float, the Doppler and the stereo offset
 
     void prepare (float topRate)
     {
-        dl.prepare ((int) std::ceil (0.060f * topRate) + 8);
-        cl.prepare ((int) std::ceil (0.060f * topRate) + 8);
+        dl.prepare ((int) std::ceil (0.020f * topRate) + 8);
+        cl.prepare ((int) std::ceil (0.020f * topRate) + 8);
+        for (DelayLine* d : { &gw, &fw, &gc, &fc })
+            d->prepare ((int) std::ceil (kMaxDoubleSec * topRate) + 8);
         dopLP.setCutoff (900.0f, topRate);
+        dopLPf.setCutoff (900.0f, topRate);
         reset();
+    }
+    // Tone -> one-pole coefficients at this rate (0 = exactly untouched)
+    static void toneCoefs (float tone, float topRate, float& aLp, float& aHp) noexcept
+    {
+        aLp = 1.0f; aHp = 0.0f;
+        if (tone < 0.0f)
+            aLp = 1.0f - std::exp (-kTwoPi * 20000.0f * std::exp2 (4.3f * tone) / topRate);
+        else if (tone > 0.0f)
+            aHp = 1.0f - std::exp (-kTwoPi * 20.0f * std::exp2 (6.2f * tone) / topRate);
     }
     void resetFits() noexcept
     {
@@ -201,12 +292,17 @@ struct InnerState
         for (int m = 0; m < 3; ++m)
             fMC[m] = fCC[m] = 0.0f;
         fYU = fUU = 0.0f;
-        fDG = -1.0f;
+        fDG = fDF = -1.0f;
         hRamp = 0.0f;
     }
     void reset() noexcept
     {
-        dl.reset(); cl.reset(); dopLP.reset(); crushPhase = 0.0f; crushHold = 0.0f;
+        dl.reset(); cl.reset(); dopLP.reset(); dopLPf.reset(); crushPhase = 0.0f; crushHold = 0.0f;
+        for (DelayLine* d : { &gw, &fw, &gc, &fc })
+            d->reset();
+        tG.reset(); tF.reset(); tGc.reset(); tFc.reset();
+        gPrev = fPrev = gcPrev = fcPrev = 0.0f;
+        lastToneG = lastToneF = 9.0f;
         resetFits();
         hF0 = -1.0f; hLive = false;
     }
@@ -230,9 +326,14 @@ inline void runInner (InnerState& st, float* top, const float* ghost, const Inne
     {
         const InnerControls& c = ctl[j];
         const float dL = c.dLamp * msToS, dG = c.dGlass * msToS, dD = c.dDop * msToS, dF = c.dFold * msToS;
+        const float dDF = c.dDopF * msToS;
         const float crushInc = std::min (1.0f, c.crushRate * invTop);
         float* t = top + j * os;
-        float resAcc = 0.0f, sL = 0.0f, sG = 0.0f, sF = 0.0f, sY = 0.0f, sDG = 0.0f, uLast = 0.0f;
+        float resAcc = 0.0f, sL = 0.0f, sG = 0.0f, sF = 0.0f, sY = 0.0f, sDG = 0.0f, sDF = 0.0f, uLast = 0.0f;
+        if (differs (c.toneG, st.lastToneG)) { st.lastToneG = c.toneG; InnerState::toneCoefs (c.toneG, topRate, st.aLpG, st.aHpG); }
+        if (differs (c.toneF, st.lastToneF)) { st.lastToneF = c.toneF; InnerState::toneCoefs (c.toneF, topRate, st.aLpF, st.aHpF); }
+        const bool toneG = st.aLpG < 1.0f || st.aHpG > 0.0f, toneF = st.aLpF < 1.0f || st.aHpF > 0.0f;
+        const bool repG = c.fbG > 0.0f, repF = c.fbF > 0.0f;
         int hCount = 0;
         const bool hOn = c.hOn > 0.0f;
         if (hOn)
@@ -256,7 +357,8 @@ inline void runInner (InnerState& st, float* top, const float* ghost, const Inne
         for (int k = 0; k < os; ++k)
         {
             float in = t[k];
-            st.cl.push (gh != nullptr ? in - gh[k] : in);
+            const float clean = gh != nullptr ? in - gh[k] : in;
+            st.cl.push (clean);
             if (c.crushMix > 0.0f)
             {
                 // Harmonic crush: the hold clock runs at N x the voice's pitch and restarts on every period,
@@ -278,15 +380,43 @@ inline void runInner (InnerState& st, float* top, const float* ghost, const Inne
                 in += c.crushMix * (q - in);
             }
             st.dl.push (in);
+            // what the doubles hear: the voice plus their own repeats (what they read a sample ago), through their Tone;
+            // their clean twins (the references) the same, repeating at the doubles' average delay
+            {
+                const float xg = repG ? in + c.fbG * st.gPrev : in, xf = repF ? in + c.fbF * st.fPrev : in;
+                const float cg = repG ? clean + c.fbG * st.gcPrev : clean, cf = repF ? clean + c.fbF * st.fcPrev : clean;
+                st.gw.push (toneG ? st.tG.process (xg, st.aLpG, st.aHpG) : xg);
+                st.fw.push (toneF ? st.tF.process (xf, st.aLpF, st.aHpF) : xf);
+                st.gc.push (toneG ? st.tGc.process (cg, st.aLpG, st.aHpG) : cg);
+                st.fc.push (toneF ? st.tFc.process (cf, st.aLpF, st.aHpF) : cf);
+            }
             // Lamp: asymmetric tube whose bias breathes with the clock
             const float lamp = shapeLamp (st.dl.read (dL), c.kLamp, c.cLamp, c.tcLamp);
             // Doppler Glass: the voice moves its own "speaker cone" (self-modulated delay)
-            const float g0 = st.dl.read (dG);
+            const float g0 = st.gw.read (dG);
             const float m = fastTanh (st.dopLP.lp (g0) * c.dopSens);
             const float dGm = dG + dD * (1.0f + m);
-            const float glass = shapeGlass (st.dl.read (dGm), c.kGlass);
-            // Fold: diode wavefolder
-            const float fold = shapeFold (st.dl.read (dF), c.kFold, c.sFold, c.ssFold);
+            const float gx = st.gw.read (dGm);
+            const float glass = shapeGlass (gx, c.kGlass);
+            // Fold: diode wavefolder (with its own Doppler, if thrown)
+            float dFm = dF;
+            if (dDF > 0.0f)
+            {
+                const float mf = fastTanh (st.dopLPf.lp (st.fw.read (dF)) * c.dopSens);
+                dFm = dF + dDF * (1.0f + mf);
+            }
+            const float fx = st.fw.read (dFm);
+            const float fold = shapeFold (fx, c.kFold, c.sFold, c.ssFold);
+            if (repG)
+            {
+                st.gPrev = gx;
+                st.gcPrev = st.gc.read (st.fDG >= 0.0f ? st.fDG : dG + dD);
+            }
+            if (repF)
+            {
+                st.fPrev = fx;
+                st.fcPrev = st.fc.read (st.fDF >= 0.0f ? st.fDF : dF + dDF);
+            }
             // CLIP: on vowels the positive ceiling sits lower (asymmetric = even harmonics), consonants stay symmetric
             const float u = (c.gLamp * lamp + c.gGlass * glass + c.gFold * fold) * c.clipIn;
             float y;
@@ -307,13 +437,16 @@ inline void runInner (InnerState& st, float* top, const float* ghost, const Inne
                 // so a 30 dB push does not count as change, only new overtones and the reshaping of the voice's own.
                 // That difference is split by the voice's overtones; each overtone the core adds is then taken
                 // back, kept or raised: the notes of the song's chord sing (Sing), the rest is dirt (Dirt).
-                sL += lamp; sG += glass; sF += fold; sY += y; sDG += dGm;
+                sL += lamp; sG += glass; sF += fold; sY += y; sDG += dGm; sDF += dFm;
                 if (++hCount == hStep)
                 {
                     // the clean voice every machine saw, at the centre of this step
                     // (the glass at its slow average delay: what the Doppler's self-modulation adds counts as distortion)
                     st.fDG = st.fDG < 0.0f ? sDG * invStep : st.fDG + (sDG * invStep - st.fDG) * aDop;
-                    const float cL = st.cl.read (dL + half), cG = st.cl.read (st.fDG + half), cF = st.cl.read (dF + half);
+                    st.fDF = st.fDF < 0.0f ? sDF * invStep : st.fDF + (sDF * invStep - st.fDF) * aDop;
+                    // (each double against its clean twin: the voice and its repeats, through the same Tone)
+                    const float cL = st.cl.read (dL + half), cG = st.gc.read (st.fDG + half);
+                    const float cF = st.fc.read ((dDF > 0.0f ? st.fDF : dF) + half);
                     const float mL = sL * invStep, mG = sG * invStep, mF = sF * invStep, mY = sY * invStep;
                     st.fMC[0] += (mL * cL - st.fMC[0]) * aFit; st.fCC[0] += (cL * cL - st.fCC[0]) * aFit;
                     st.fMC[1] += (mG * cG - st.fMC[1]) * aFit; st.fCC[1] += (cG * cG - st.fCC[1]) * aFit;
@@ -347,7 +480,7 @@ inline void runInner (InnerState& st, float* top, const float* ghost, const Inne
                     corr *= c.clipOut * st.hRamp;
                     for (int q = k - hStep + 1; q <= k; ++q)   // centred on the same samples it was measured on
                         t[q] -= corr;
-                    sL = sG = sF = sY = sDG = 0.0f;
+                    sL = sG = sF = sY = sDG = sDF = 0.0f;
                     hCount = 0;
                 }
             }
@@ -517,6 +650,11 @@ public:
         }
         for (auto& g : guiPhase) g.store (0.0f);
         for (auto& g : guiDuck) g.store (1.0f);
+        for (int i = 0; i < kImg; ++i)
+        {
+            imgPreL[i].store (0.0f); imgPreR[i].store (0.0f);
+            imgPostL[i].store (0.0f); imgPostR[i].store (0.0f);
+        }
     }
 
     static constexpr int   kSub   = 64;      // internal block
@@ -599,6 +737,24 @@ public:
     // the GUI is looking at the overtone map / scope: the left channel's core is metered
     void setMetering (bool b) noexcept { metering.store (b, std::memory_order_relaxed); }
 
+    // IMAGER: the last kImg base samples of the wet sound before and after the imager (left, right), oldest first
+    static constexpr int kImg = 2048;
+    void copyImager (float* preL, float* preR, float* postL, float* postR) const noexcept
+    {
+        const int w = imgPos.load (std::memory_order_acquire);
+        for (int i = 0; i < kImg; ++i)
+        {
+            const int r = (w + i) & (kImg - 1);
+            preL[i] = imgPreL[r].load (std::memory_order_relaxed);
+            preR[i] = imgPreR[r].load (std::memory_order_relaxed);
+            postL[i] = imgPostL[r].load (std::memory_order_relaxed);
+            postR[i] = imgPostR[r].load (std::memory_order_relaxed);
+        }
+    }
+    void setImagerMetering (bool b) noexcept { imgMetering.store (b, std::memory_order_relaxed); }
+    bool isImagerActive() const noexcept { return guiImgOn.load (std::memory_order_relaxed); }
+    double getSampleRate() const noexcept { return fs; }
+
     void process (float* const* io, int numCh, int n) noexcept
     {
         numCh = std::min (numCh, 2);
@@ -619,6 +775,15 @@ public:
 
 private:
     void processSub (float* const* io, int numCh, int off, int n) noexcept;
+    void resetImager() noexcept
+    {
+        imgSplitS.reset(); imgSplitD.reset();
+        imgSumS.reset(); imgSumD.reset(); imgSumR.reset();
+        for (auto& b : imgApM) b.reset();
+        for (auto& c : imgApDry) for (auto& b : c) b.reset();
+        imgSpread.reset(); imgRecover.reset();
+        imgLive = imgSpreadLive = imgRecLive = false;
+    }
     void updateBlock() noexcept;
     void computeProbe() noexcept;
     int  desiredPath (int n) noexcept;
@@ -662,7 +827,7 @@ private:
         float f0 = 150.0f, fMeas = 150.0f, lastDelta = 0.0f, pitchConf = 0.0f, noteSemi = -9.9f;
         bool newPeriod = false;
         Envelope crushEnv;
-        float dLampS = 0.8f, dGlassS = 23.0f, dFoldS = 37.0f, dDopS = 0.0f;
+        float dLampS = 0.8f, dGlassS = 23.0f, dFoldS = 37.0f, dDopS = 0.0f, dDopFS = 0.0f;
         OnePole dc;
         Biquad smLP;
         Envelope smEnvLo, smEnvHi;
@@ -741,6 +906,22 @@ private:
     int numChordPc = 1;
     float aConf = 0.01f;
     float pushS = 0.0f, aPushAtk = 0.1f, aPushRel = 0.01f;   // Force: how hard the voice pushes right now (0..1)
+    // THE DOUBLES: their slow float (phase) and their attack doors (delayed by each double's own time)
+    float floatPhG = 0.0f, floatPhF = 0.25f, doorGs = 1.0f, doorFs = 1.0f, aDoor = 0.1f;
+    DelayLine doorG, doorF;
+    // IMAGER: the side of the wet sound in four bands; the mid and the dry get the very same all-pass, so
+    // nothing moves against anything and the mono sum never changes
+    ImgSplit imgSplitS, imgSplitD;
+    ImgSum imgSumS, imgSumD, imgSumR;
+    Biquad imgApM[3], imgApDry[2][3];
+    ImgDisperse imgSpread, imgRecover;
+    float imgG[4] = { 1.0f, 1.0f, 1.0f, 1.0f }, imgSp[4] {}, imgRec = 0.0f, imgX[3] = { -1.0f, -1.0f, -1.0f };
+    float imgMix = 0.0f, aImg = 0.01f;
+    int imgQuiet = 0;
+    bool imgLive = false, imgSpreadLive = false, imgRecLive = false;
+    std::atomic<float> imgPreL[kImg], imgPreR[kImg], imgPostL[kImg], imgPostR[kImg];
+    std::atomic<int> imgPos { 0 };
+    std::atomic<bool> imgMetering { false }, guiImgOn { false };
     inkey::Comp compInt, compAll;   // leakage compensation: the overtone bands alone / with the half-overtone bands
     float gNslowDb = 0.0f, aGnSlow = 0.001f;                 // POLISH density: the slow part of the leveling
     CoreMonitor mon;
@@ -850,6 +1031,22 @@ inline void Engine::prepare (double sampleRate, int /*numChannels*/)
         c.rsShelf.highShelf (9000.0, -6.0, fs);
     }
     rsSideHP.setCutoff (250.0f, fsf);
+    doorG.prepare ((int) std::ceil (0.35f * fsf) + 8);
+    doorF.prepare ((int) std::ceil (0.35f * fsf) + 8);
+    aDoor = smoothCoef (2.0f, fsf);
+    {
+        const float nyq = 0.45f * fsf;
+        const float spF[ImgDisperse::kN] = { 150.0f, 420.0f, 1100.0f, 2900.0f, 6800.0f, std::min (13500.0f, nyq) };
+        const float rcF[ImgDisperse::kN] = { 230.0f, 610.0f, 1600.0f, 4100.0f, 9200.0f, std::min (16500.0f, nyq) };
+        imgSpread.design (spF, fs);
+        imgRecover.design (rcF, fs);
+    }
+    aImg = smoothCoef (25.0f, fsf);
+    for (int i = 0; i < kImg; ++i)
+    {
+        imgPreL[i].store (0.0f); imgPreR[i].store (0.0f);
+        imgPostL[i].store (0.0f); imgPostR[i].store (0.0f);
+    }
     compInt.design (InnerControls::kHarm);
     compAll.design (InnerControls::kBands);
     aGnSlow = smoothCoef (800.0f, fsf);
@@ -953,7 +1150,8 @@ inline void Engine::reset() noexcept
         c.ghostLP.reset(); c.ghostSubLP.reset(); c.ghostUpLP.reset(); c.ghostEnv.reset(); c.ghostUpHP.reset();
         c.zPrev = 0.0f; c.flip = 1.0f; c.armed = false;
         c.crossCount = 0; c.f0 = 150.0f; c.fMeas = 150.0f; c.noteSemi = -9.9f; c.lastDelta = 0.0f; c.pitchConf = 0.0f; c.newPeriod = false; c.crushEnv.reset();
-        c.dLampS = lampBaseMs; c.dGlassS = 23.0f; c.dFoldS = 37.0f; c.dDopS = 0.0f;
+        c.dLampS = lampBaseMs; c.dGlassS = prm[P_GTIME] > 0.0f ? prm[P_GTIME] : 23.0f;
+        c.dFoldS = prm[P_FTIME] > 0.0f ? prm[P_FTIME] : 37.0f; c.dDopS = 0.0f; c.dDopFS = 0.0f;
         c.dc.reset();
         c.smLP.reset(); c.smEnvLo.reset(); c.smEnvHi.reset(); c.smGain = 1.0f;
         c.harpHP.reset(); c.harpLP.reset(); c.harp.reset();
@@ -967,6 +1165,13 @@ inline void Engine::reset() noexcept
     rsLive = false;
     pushS = 0.0f;
     gNslowDb = 0.0f;
+    floatPhG = 0.0f; floatPhF = 0.25f; doorGs = doorFs = 1.0f;
+    doorG.reset(); doorF.reset();
+    resetImager();
+    imgMix = 0.0f; imgQuiet = 0;
+    for (int b = 0; b < 4; ++b) { imgG[b] = 1.0f; imgSp[b] = 0.0f; }
+    imgRec = 0.0f;
+    for (auto& x : imgX) x = -1.0f;
     mon = CoreMonitor();
     for (float& l : otLevelS) l = -120.0f;
     envCons.reset(); inkFast.reset(); inkSlow.reset(); vEnvLo.reset(); vEnvHi.reset();
@@ -995,8 +1200,9 @@ inline void Engine::computeProbe() noexcept
 {
     const float drv = tDrive, grit = prm[P_GRIT], bias = prm[P_BIAS];
     const float c0 = 1.2f * bias, tc0 = fastTanh (c0);
-    const float kG = 0.65f * drv;
-    const float kF = std::min (24.0f, drv * (0.6f + 2.4f * grit));
+    const float driveG = dbToGain (prm[P_GDRIVE]), driveF = dbToGain (prm[P_FDRIVE]);
+    const float kG = 0.65f * drv * driveG;
+    const float kF = std::min (24.0f * std::max (1.0f, driveF), drv * (0.6f + 2.4f * grit) * driveF);
     const float s0 = 0.45f * grit, ss0 = fastSin (s0);
 
     const float gl = prm[P_LAMP], gg = prm[P_GLASS], gf = prm[P_FOLD];
@@ -1210,6 +1416,29 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
     const float inkDecay = std::exp (-2.5f / (0.001f * std::max (v[P_INKTIME], 10.0f) * fsf));
     const float gd = v[P_GHOSTDOWN], gu = v[P_GHOSTUP];
     const float doppler = v[P_DOPPLER], bias = v[P_BIAS], grit = v[P_GRIT];
+    // THE DOUBLES, finely: time (free or on the beat), repeats, float, tone, drive, attack
+    static const float kSyncQuarters[7] = { 0.0f, 0.0625f, 0.125f, 1.0f / 6.0f, 0.25f, 1.0f / 3.0f, 0.5f };
+    auto doubleTime = [&] (int timeP, int syncP)
+    {
+        const int s = std::min (std::max ((int) (v[syncP] + 0.5f), 0), 6);
+        return s == 0 ? v[timeP] : std::min (300.0f, kSyncQuarters[s] * (float) (60000.0 / hostBpm));
+    };
+    const float timeG = doubleTime (P_GTIME, P_GSYNC), timeF = doubleTime (P_FTIME, P_FSYNC);
+    const float driveG = dbToGain (v[P_GDRIVE]), driveF = dbToGain (v[P_FDRIVE]);
+    // the slow float: depth in cents -> how far the read swings (ms) at that rate (a swing of 15 ms at most)
+    const float floatG = std::min (15.0f, 1000.0f * v[P_GFLOAT] * 0.000578f / (kTwoPi * std::max (0.05f, v[P_GRATE])));
+    const float floatF = std::min (15.0f, 1000.0f * v[P_FFLOAT] * 0.000578f / (kTwoPi * std::max (0.05f, v[P_FRATE])));
+    const float floatIncG = v[P_GRATE] / fsf, floatIncF = v[P_FRATE] / fsf;
+    const float attG = v[P_GATTACK], attF = v[P_FATTACK];
+    const float openG = 1.0f / (0.001f * std::max (5.0f, v[P_GOPEN]) * fsf), openF = 1.0f / (0.001f * std::max (5.0f, v[P_FOPEN]) * fsf);
+    const float doorDG = 0.001f * timeG * fsf, doorDF = 0.001f * timeF * fsf;
+    // the door of a double after an onset: -1 = closed on the attack, opens after it; +1 = only the attack
+    auto door = [] (float att, float since, float inv) noexcept
+    {
+        if (std::fabs (att) < 1.0e-6f) return 1.0f;
+        const float d = 1.0f - std::exp (-since * inv);
+        return att < 0.0f ? 1.0f + att * (1.0f - d) : (1.0f + att * (1.0f - d)) * (1.0f - 0.5f * att * d);
+    };
     const float clipGain = dbToGain (grit * 15.0f);
     const float clipIn = 2.0f * clipGain, clipOut = 0.5f / clipGain, clipH = 1.0f - clampf (v[P_SHOULDER], 0.0f, 1.0f);
     const float clipP = v[P_CLIP], clipBase = dbToGain (18.0f * clipP);
@@ -1336,6 +1565,18 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
             strokeRem *= inkDecay;
         }
         strokeBuf[j] = strokeRem;
+        // THE DOUBLES: the slow float, and each double's door - delayed by its own time, so it shapes
+        // the double's own copy of the attack
+        floatPhG += floatIncG; floatPhG -= std::floor (floatPhG);
+        floatPhF += floatIncF; floatPhF -= std::floor (floatPhF);
+        doorG.push (door (attG, (float) sinceOnset, openG));
+        doorF.push (door (attF, (float) sinceOnset, openF));
+        doorGs += ((std::fabs (attG) < 1.0e-6f ? 1.0f : doorG.read (std::max (1.0f, doorDG))) - doorGs) * aDoor;
+        doorFs += ((std::fabs (attF) < 1.0e-6f ? 1.0f : doorF.read (std::max (1.0f, doorDF))) - doorFs) * aDoor;
+        if (std::fabs (attG) < 1.0e-6f && std::fabs (doorGs - 1.0f) < 1.0e-5f) doorGs = 1.0f;
+        if (std::fabs (attF) < 1.0e-6f && std::fabs (doorFs - 1.0f) < 1.0e-5f) doorFs = 1.0f;
+        const float flSinG = floatG > 0.0f ? std::sin (kTwoPi * floatPhG) : 0.0f, flCosG = floatG > 0.0f ? std::cos (kTwoPi * floatPhG) : 0.0f;
+        const float flSinF = floatF > 0.0f ? std::sin (kTwoPi * floatPhF) : 0.0f, flCosF = floatF > 0.0f ? std::cos (kTwoPi * floatPhF) : 0.0f;
         slS1 *= aSl;
         slS2 = aSl * slS2 + (1.0f - aSl) * slS1;
         const float slantMs = clampf (slS2, -6.0f, 6.0f);
@@ -1490,25 +1731,35 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
 
             // core controls
             const float dLampT  = lampBaseMs + 0.55f * vib * lfo[0];
-            const float dGlassT = (c == 0 ? 23.0f : 23.0f + 6.0f * width) + 3.0f * ens * lfo[1];
-            const float dFoldT  = (c == 0 ? 37.0f : 37.0f - 7.0f * width) + 3.0f * ens * lfo[2];
+            // (the right channel floats a quarter turn behind the left: a slow stereo sway)
+            const float dGlassT = (c == 0 ? timeG : timeG + 6.0f * width) + 3.0f * ens * lfo[1]
+                                  + (floatG > 0.0f ? floatG * (c == 0 ? flSinG : -flCosG) : 0.0f);
+            const float dFoldT  = (c == 0 ? timeF : std::max (1.0f, timeF - 7.0f * width)) + 3.0f * ens * lfo[2]
+                                  + (floatF > 0.0f ? floatF * (c == 0 ? flSinF : -flCosF) : 0.0f);
             const float dDopT   = 0.32f * doppler * inkDop * (1.0f + 0.6f * motion * lfo[3]);
+            const float dDopFT  = 0.32f * v[P_FTHROW] * inkDop * (1.0f + 0.6f * motion * lfo[2]);
             C.dLampS  += (dLampT - C.dLampS) * aCtl;
             C.dGlassS += (dGlassT - C.dGlassS) * aCtl;
             C.dFoldS  += (dFoldT - C.dFoldS) * aCtl;
             C.dDopS   += (dDopT - C.dDopS) * aCtl;
+            C.dDopFS  += (dDopFT - C.dDopFS) * aCtl;
 
             InnerControls& k = ctl[c][j];
             k.dLamp  = C.dLampS;
             k.dGlass = C.dGlassS + slantMs;          // the doubles draw the stroke,
             k.dFold  = C.dFoldS + 1.4f * slantMs;    // the lamp (lead) stays in tune
             k.dDop   = std::max (0.0f, C.dDopS);
+            k.dDopF  = C.dDopFS > 1.0e-5f ? C.dDopFS : 0.0f;
+            k.fbG = v[P_GREPEATS];
+            k.fbF = v[P_FREPEATS];
+            k.toneG = v[P_GTONE];
+            k.toneF = v[P_FTONE];
             k.kLamp  = drv;
             k.cLamp  = 1.2f * bias + 0.6f * breath * lfo[1];
             k.tcLamp = fastTanh (k.cLamp);
-            k.kGlass = 0.65f * drv;
+            k.kGlass = 0.65f * drv * driveG;
             k.dopSens = 4.0f;
-            k.kFold  = std::min (24.0f, drv * (0.6f + 2.4f * grit));
+            k.kFold  = std::min (24.0f * std::max (1.0f, driveF), drv * (0.6f + 2.4f * grit) * driveF);
             k.sFold  = 0.45f * grit + 0.35f * grit * motion * lfo[3];
             k.ssFold = fastSin (k.sFold);
 
@@ -1519,8 +1770,8 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
             const float pulG = 1.0f - pulse * (0.5f + 0.5f * lfo[2]);
             const float pulF = 1.0f - pulse * (0.5f - 0.5f * lfo[2]);
             k.gLamp  = sLamp * compLamp * mixNorm;
-            k.gGlass = sGlass * compGlass * mixNorm * pg * pulG;
-            k.gFold  = sFold * compFold * mixNorm * pf * pulF;
+            k.gGlass = sGlass * compGlass * mixNorm * pg * pulG * doorGs;
+            k.gFold  = sFold * compFold * mixNorm * pf * pulF * doorFs;
             // CLIP: the ceiling is pressed by the pen (Ink: bites into the body of the word, Press: slams the attack)
             // and breathes with the chord clock; level is half-compensated so the pressure is felt, not just heard louder
             const float dynDb = clipP * ((ink >= 0.0f ? 12.0f * inkA * (1.0f - strokeRem) : 12.0f * inkA * strokeRem)
@@ -1722,6 +1973,51 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
     const float ligTRt = std::min (0.75f * beatS, 1.5f * fsf);   // dotted 1/8
     if (ligTL <= 0.0f) { ligTL = ligTLt; ligTR = ligTRt; }
 
+    // IMAGER: what the bands should be (the crossovers keep at least a third of an octave apart)
+    float imgGt[4], imgSpt[4];
+    bool imgWant = false, spreadWant = false;
+    for (int b = 0; b < 4; ++b)
+    {
+        imgGt[b] = 1.0f + clampf (v[P_IW1 + b], -1.0f, 1.0f);
+        imgSpt[b] = clampf (v[P_IS1 + b], 0.0f, 1.0f);
+        if (std::fabs (imgGt[b] - 1.0f) > 1.0e-4f || imgSpt[b] > 1.0e-4f) imgWant = true;
+        if (imgSpt[b] > 1.0e-4f) spreadWant = true;
+    }
+    const float imgRect = clampf (v[P_IRECOVER], 0.0f, 1.0f);
+    const bool recWant = imgRect > 1.0e-4f && (imgGt[0] < 0.9999f || imgGt[1] < 0.9999f || imgGt[2] < 0.9999f || imgGt[3] < 0.9999f);
+    imgWant = imgWant && stereo;
+    // engage at once; let go only after a second at neutral (so automation passing through 0 does not flip it)
+    if (imgWant) imgQuiet = 0;
+    else if (imgQuiet < 1 << 20) imgQuiet += n;
+    const bool imgOn = imgWant || (imgLive && imgQuiet < (int) fsf);
+    if (imgOn || imgLive)
+    {
+        float xt[3] = { clampf (v[P_IX1], 20.0f, 0.4f * fsf), clampf (v[P_IX2], 20.0f, 0.4f * fsf), clampf (v[P_IX3], 20.0f, 0.4f * fsf) };
+        xt[1] = std::min (std::max (xt[1], xt[0] * 1.26f), 0.4f * fsf);
+        xt[2] = std::min (std::max (xt[2], xt[1] * 1.26f), 0.42f * fsf);
+        bool moved = imgX[0] < 0.0f;
+        for (int i = 0; i < 3; ++i)
+        {
+            // glide (a fifth of the way per block), so a dragged crossover does not click
+            const float nx = imgX[i] < 0.0f ? xt[i] : imgX[i] * std::pow (xt[i] / imgX[i], 0.2f);
+            if (std::fabs (nx - imgX[i]) > 1.0e-3f * xt[i]) { imgX[i] = nx; moved = true; }
+        }
+        if (moved)
+        {
+            imgSplitS.design (imgX, fs); imgSplitD.design (imgX, fs);
+            imgSumS.design (imgX, fs); imgSumD.design (imgX, fs); imgSumR.design (imgX, fs);
+            for (int i = 0; i < 3; ++i)
+            {
+                imgApM[i].allpass (imgX[i], 0.70710678, fs);
+                imgApDry[0][i].allpass (imgX[i], 0.70710678, fs);
+                imgApDry[1][i].allpass (imgX[i], 0.70710678, fs);
+            }
+        }
+    }
+    guiImgOn.store (imgOn, std::memory_order_relaxed);
+    const bool imgMeter = imgMetering.load (std::memory_order_relaxed);
+    int imgW = imgPos.load (std::memory_order_relaxed);
+
     float check = 0.0f;
     for (int j = 0; j < n; ++j)
     {
@@ -1821,6 +2117,72 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
         }
         clipPeak = std::max (clipPeak, clipHitMono / (float) numCh);
 
+        // IMAGER: the width of the wet sound in four bands. Only the side changes; the mid (and the dry, below)
+        // pass through the same all-pass as the bands, so the mono sum is untouched and nothing smears.
+        float dryAp[2] = { dryOut[0][j], stereo ? dryOut[1][j] : 0.0f };
+        const float preL = wv[0], preR = stereo ? wv[1] : wv[0];
+        if (imgOn || imgLive)
+        {
+            if (! imgLive) { resetImager(); imgLive = true; }
+            imgMix += ((imgOn ? 1.0f : 0.0f) - imgMix) * aImg;
+            for (int b = 0; b < 4; ++b)
+            {
+                imgG[b] += (imgGt[b] - imgG[b]) * aS;
+                imgSp[b] += (imgSpt[b] - imgSp[b]) * aS;
+            }
+            imgRec += ((recWant ? imgRect : 0.0f) - imgRec) * aS;
+
+            const float m = 0.5f * (wv[0] + wv[1]), s = 0.5f * (wv[0] - wv[1]);
+            float bs[4];
+            imgSplitS.split (s, bs);
+            float s2 = imgSumS.sum (bs, imgG);
+
+            // SPREAD: a dispersed copy of the mid goes into the side of its band - width for what has none
+            const bool spreadOn = spreadWant || imgSp[0] + imgSp[1] + imgSp[2] + imgSp[3] > 1.0e-5f;
+            if (spreadOn)
+            {
+                if (! imgSpreadLive) { imgSpread.reset(); imgSplitD.reset(); imgSumD.reset(); imgSpreadLive = true; }
+                float bd[4];
+                imgSplitD.split (imgSpread.process (m), bd);
+                s2 += 0.7f * imgSumD.sum (bd, imgSp);
+            }
+            else imgSpreadLive = false;
+
+            float m2 = imgApM[2].process (imgApM[1].process (imgApM[0].process (m)));
+
+            // RECOVER: what narrowing takes out of the side comes back in the middle (dispersed, so it adds body
+            // instead of combing with the mid)
+            if (recWant || imgRec > 1.0e-5f)
+            {
+                if (! imgRecLive) { imgRecover.reset(); imgSumR.reset(); imgRecLive = true; }
+                const float rg[4] = { std::max (0.0f, 1.0f - imgG[0]), std::max (0.0f, 1.0f - imgG[1]),
+                                      std::max (0.0f, 1.0f - imgG[2]), std::max (0.0f, 1.0f - imgG[3]) };
+                m2 += imgRec * 0.7f * imgRecover.process (imgSumR.sum (bs, rg));
+            }
+            else imgRecLive = false;
+
+            wv[0] += imgMix * (m2 + s2 - wv[0]);
+            wv[1] += imgMix * (m2 - s2 - wv[1]);
+            for (int c = 0; c < 2; ++c)
+            {
+                const float a = imgApDry[c][2].process (imgApDry[c][1].process (imgApDry[c][0].process (dryAp[c])));
+                dryAp[c] += imgMix * (a - dryAp[c]);
+            }
+            if (! imgOn && imgMix < 1.0e-4f)
+            {
+                resetImager();
+                imgMix = 0.0f;
+            }
+        }
+        if (imgMeter)
+        {
+            imgPreL[imgW].store (preL, std::memory_order_relaxed);
+            imgPreR[imgW].store (preR, std::memory_order_relaxed);
+            imgPostL[imgW].store (wv[0], std::memory_order_relaxed);
+            imgPostR[imgW].store (stereo ? wv[1] : wv[0], std::memory_order_relaxed);
+            imgW = (imgW + 1) & (kImg - 1);
+        }
+
         // AURA: nonlinear send effects, added after the dry/wet mix (like a send return)
         float aura[2] = { 0.0f, 0.0f };
         sEcho   += (tEcho - sEcho) * aS;
@@ -1914,7 +2276,7 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
 
         for (int c = 0; c < numCh; ++c)
         {
-            float out = (sDryG * dryOut[c][j] + wet[c]) * sOut;
+            float out = (sDryG * dryAp[c] + wet[c]) * sOut;
             if (limitOn)
             {   // output stage: transparent below -2.5 dBFS, then a soft knee that never passes 0 dBFS
                 const float a = std::fabs (out);
@@ -1926,6 +2288,8 @@ inline void Engine::processSub (float* const* io, int numCh, int off, int n) noe
         }
     }
 
+    if (imgMeter)
+        imgPos.store (imgW, std::memory_order_release);
     if (clipPeak > guiClip.load (std::memory_order_relaxed))
         guiClip.store (clipPeak, std::memory_order_relaxed);
 

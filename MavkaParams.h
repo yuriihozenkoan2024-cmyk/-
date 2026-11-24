@@ -9,7 +9,7 @@ namespace mavka
 {
 
 enum class PType { Float, Choice, Bool };
-enum class Unit  { Percent, Bipolar, Ink, Slant, Db, Hz, Ms, Sec, Tone, Cents, None };
+enum class Unit  { Percent, Bipolar, Ink, Slant, Db, Hz, Ms, Sec, Tone, Cents, Ct, Door, None };
 
 struct ParamDef
 {
@@ -35,6 +35,7 @@ static const char* const kEchoTimeChoices[] = { "Slap", "1/16", "1/8", "1/8D", "
 static const char* const kForestChoices[]   = { "Room", "Plate", "Hall", "Cathedral" };
 static const char* const kTwinChoices[]     = { "Tight", "Wide", "Lush", "Choir", "Octave" };
 static const char* const kDuckChoices[]     = { "Spectral", "Classic", "Off" };
+static const char* const kSyncChoices[]     = { "Free", "1/64", "1/32", "1/16T", "1/16", "1/8T", "1/8" };
 static const char* const kCrushChoices[]    = { "Harmonic", "Digital", "Clock" };
 static const char* const kFlangeChoices[]   = { "Tuned", "Jet", "Stroke" };
 
@@ -68,6 +69,11 @@ enum ParamIndex
     P_REVSAFE,
     // tuning reference of everything that plays in key (like Detune in Auto-Tune): cents from A4 = 440 Hz
     P_DETUNE,
+    // THE DOUBLES, finely (Glass: its Throw is the Doppler knob; Fold gets its own)
+    P_GTIME, P_GSYNC, P_GREPEATS, P_GFLOAT, P_GRATE, P_GTONE, P_GDRIVE, P_GATTACK, P_GOPEN,
+    P_FTIME, P_FSYNC, P_FREPEATS, P_FTHROW, P_FFLOAT, P_FRATE, P_FTONE, P_FDRIVE, P_FATTACK, P_FOPEN,
+    // IMAGER: the width of the wet sound in four bands
+    P_IX1, P_IX2, P_IX3, P_IW1, P_IW2, P_IW3, P_IW4, P_IS1, P_IS2, P_IS3, P_IS4, P_IRECOVER,
     P_COUNT
 };
 
@@ -164,6 +170,37 @@ inline const ParamDef* paramDefs() noexcept
         { "ot12",        "Overtone 12",   PType::Float, -30.0f, 12.0f, 0.0f,  0.0f, Unit::Db,      nullptr, 0 },
         { "reverbSafe",  "Reverb Safe",   PType::Bool,   0.0f, 1.0f,   0.0f,  0.0f, Unit::None,    nullptr, 0 },
         { "detune",      "Detune",        PType::Float, -100.0f, 100.0f, 0.0f, 0.0f, Unit::Cents, nullptr, 0 },
+        { "glassTime",   "Glass Time",    PType::Float,  2.0f, 300.0f, 23.0f, 40.0f, Unit::Ms,     nullptr, 0 },
+        { "glassSync",   "Glass Sync",    PType::Choice, 0.0f, 6.0f,   0.0f,  0.0f,  Unit::None,   kSyncChoices, 7 },
+        { "glassRepeats","Glass Repeats", PType::Float,  0.0f, 0.95f,  0.0f,  0.0f,  Unit::Percent, nullptr, 0 },
+        { "glassFloat",  "Glass Float",   PType::Float,  0.0f, 50.0f,  0.0f,  0.0f,  Unit::Ct,     nullptr, 0 },
+        { "glassRate",   "Glass Rate",    PType::Float,  0.05f, 10.0f, 0.70f, 1.0f,  Unit::Hz,     nullptr, 0 },
+        { "glassTone",   "Glass Tone",    PType::Float, -1.0f, 1.0f,   0.0f,  0.0f,  Unit::Tone,   nullptr, 0 },
+        { "glassDrive",  "Glass Drive",   PType::Float, -12.0f, 12.0f, 0.0f,  0.0f,  Unit::Db,     nullptr, 0 },
+        { "glassAttack", "Glass Attack",  PType::Float, -1.0f, 1.0f,   0.0f,  0.0f,  Unit::Door,   nullptr, 0 },
+        { "glassOpen",   "Glass Open",    PType::Float,  5.0f, 600.0f, 120.0f, 100.0f, Unit::Ms,   nullptr, 0 },
+        { "foldTime",    "Fold Time",     PType::Float,  2.0f, 300.0f, 37.0f, 40.0f, Unit::Ms,     nullptr, 0 },
+        { "foldSync",    "Fold Sync",     PType::Choice, 0.0f, 6.0f,   0.0f,  0.0f,  Unit::None,   kSyncChoices, 7 },
+        { "foldRepeats", "Fold Repeats",  PType::Float,  0.0f, 0.95f,  0.0f,  0.0f,  Unit::Percent, nullptr, 0 },
+        { "foldThrow",   "Fold Throw",    PType::Float,  0.0f, 1.0f,   0.0f,  0.0f,  Unit::Percent, nullptr, 0 },
+        { "foldFloat",   "Fold Float",    PType::Float,  0.0f, 50.0f,  0.0f,  0.0f,  Unit::Ct,     nullptr, 0 },
+        { "foldRate",    "Fold Rate",     PType::Float,  0.05f, 10.0f, 0.45f, 1.0f,  Unit::Hz,     nullptr, 0 },
+        { "foldTone",    "Fold Tone",     PType::Float, -1.0f, 1.0f,   0.0f,  0.0f,  Unit::Tone,   nullptr, 0 },
+        { "foldDrive",   "Fold Drive",    PType::Float, -12.0f, 12.0f, 0.0f,  0.0f,  Unit::Db,     nullptr, 0 },
+        { "foldAttack",  "Fold Attack",   PType::Float, -1.0f, 1.0f,   0.0f,  0.0f,  Unit::Door,   nullptr, 0 },
+        { "foldOpen",    "Fold Open",     PType::Float,  5.0f, 600.0f, 120.0f, 100.0f, Unit::Ms,   nullptr, 0 },
+        { "imgX1",       "Imager X1",     PType::Float,  40.0f, 1000.0f, 180.0f, 180.0f, Unit::Hz, nullptr, 0 },
+        { "imgX2",       "Imager X2",     PType::Float,  300.0f, 6000.0f, 1200.0f, 1200.0f, Unit::Hz, nullptr, 0 },
+        { "imgX3",       "Imager X3",     PType::Float,  1500.0f, 18000.0f, 5500.0f, 5500.0f, Unit::Hz, nullptr, 0 },
+        { "imgW1",       "Imager Width 1",  PType::Float, -1.0f, 1.0f, 0.0f, 0.0f, Unit::Bipolar, nullptr, 0 },
+        { "imgW2",       "Imager Width 2",  PType::Float, -1.0f, 1.0f, 0.0f, 0.0f, Unit::Bipolar, nullptr, 0 },
+        { "imgW3",       "Imager Width 3",  PType::Float, -1.0f, 1.0f, 0.0f, 0.0f, Unit::Bipolar, nullptr, 0 },
+        { "imgW4",       "Imager Width 4",  PType::Float, -1.0f, 1.0f, 0.0f, 0.0f, Unit::Bipolar, nullptr, 0 },
+        { "imgS1",       "Imager Spread 1", PType::Float, 0.0f, 1.0f, 0.0f, 0.0f, Unit::Percent, nullptr, 0 },
+        { "imgS2",       "Imager Spread 2", PType::Float, 0.0f, 1.0f, 0.0f, 0.0f, Unit::Percent, nullptr, 0 },
+        { "imgS3",       "Imager Spread 3", PType::Float, 0.0f, 1.0f, 0.0f, 0.0f, Unit::Percent, nullptr, 0 },
+        { "imgS4",       "Imager Spread 4", PType::Float, 0.0f, 1.0f, 0.0f, 0.0f, Unit::Percent, nullptr, 0 },
+        { "imgRecover",  "Imager Recover",  PType::Float, 0.0f, 1.0f, 0.0f, 0.0f, Unit::Percent, nullptr, 0 },
     };
     return d;
 }

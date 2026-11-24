@@ -100,6 +100,14 @@ struct Biquad
         set ((1.0 + c) * 0.5, -(1.0 + c), (1.0 + c) * 0.5, 1.0 + al, -2.0 * c, 1.0 - al);
     }
 
+    // flat magnitude, the phase turns through 360 degrees around fc (with q = 1/sqrt2 it is exactly what a
+    // Linkwitz-Riley low + high pair at fc sums to)
+    void allpass (double fc, double q, double fs) noexcept
+    {
+        const double w = omega (fc, fs), c = std::cos (w), al = std::sin (w) / (2.0 * q);
+        set (1.0 - al, -2.0 * c, 1.0 + al, 1.0 + al, -2.0 * c, 1.0 - al);
+    }
+
     void lowShelf (double fc, double db, double fs) noexcept
     {
         const double A = std::pow (10.0, db / 40.0), w = omega (fc, fs), c = std::cos (w);

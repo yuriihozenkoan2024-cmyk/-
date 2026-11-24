@@ -154,6 +154,11 @@ int main (int argc, char** argv)
         check (std::abs (c447 - 27.31f) < 0.05f && std::abs (c432 + 31.77f) < 0.05f && std::abs (cCt + 12.5f) < 0.05f,
                "Detune accepts 447 / 432.0 Hz / -12.5 ct");
         check (det->getText (det->convertTo0to1 (c447), 32) == "447.0 Hz", "Detune shows 447.0 Hz back");
+        auto txt = [&] (const char* id) { auto* q = p.apvts.getParameter (id); return q->getText (q->getDefaultValue(), 32); };
+        check (txt ("glassTime") == "23.0 ms" && txt ("foldTime") == "37.0 ms" && txt ("glassSync") == "Free"
+               && txt ("glassTone") == "Neutral" && txt ("foldAttack") == "Natural" && txt ("glassRate") == "0.70 Hz"
+               && txt ("imgX1") == "180 Hz" && txt ("imgX2") == "1.2 kHz" && txt ("imgW3") == "0%",
+               "the doubles and imager parameters exist with the earlier sound as their defaults");
         // a preset load keeps the song: key, chord and tuning
         p.apvts.getParameter ("key")->setValueNotifyingHost (p.apvts.getParameter ("key")->convertTo0to1 (9.0f));
         det->setValueNotifyingHost (det->convertTo0to1 (c447));
@@ -217,6 +222,24 @@ int main (int argc, char** argv)
                 echo->enterValue ("50%");
             }
             check (typed, "typing a value into a knob (Detune: 447) and a fader (Echo: 25%) sets it exactly");
+
+            // the DOUBLES and IMAGER tabs: their knobs take typed values too
+            auto typeInto = [&] (const char* id, const char* text, float want)
+            {
+                auto* k = dynamic_cast<mavkaui::Knob*> (find (*ed, id));
+                if (k == nullptr) return false;
+                k->enterValue (text);
+                return std::abs (p.apvts.getRawParameterValue (id)->load() - want) < 1.0e-3f * (1.0f + std::abs (want));
+            };
+            const bool fine = typeInto ("glassTime", "80", 80.0f) && typeInto ("foldTime", "12.5 ms", 12.5f)
+                              && typeInto ("glassAttack", "Skip 60", -0.6f) && typeInto ("foldAttack", "grab 25%", 0.25f)
+                              && typeInto ("glassTone", "dark 30", -0.3f) && typeInto ("glassRate", "0.25 Hz", 0.25f)
+                              && typeInto ("imgX1", "250 Hz", 250.0f) && typeInto ("imgX3", "7.5k", 7500.0f)
+                              && typeInto ("imgW2", "-40%", -0.4f) && typeInto ("imgS4", "35%", 0.35f);
+            check (fine, "DOUBLES / IMAGER knobs take typed values (80 ms, Skip 60, dark 30, 250 Hz, 7.5k, -40%...)");
+            for (auto* id : { "glassTime", "foldTime", "glassAttack", "foldAttack", "glassTone", "glassRate", "imgX1", "imgX3", "imgW2", "imgS4" })
+                if (auto* prm = p.apvts.getParameter (id))
+                    prm->setValueNotifyingHost (prm->getDefaultValue());
         }
 
         juce::AudioBuffer<float> voice;
@@ -234,8 +257,16 @@ int main (int argc, char** argv)
         juce::MidiBuffer midi;
         editor.selectPage (5);   // the CLIP tab meters the core while the audio runs
         const int ticks = 205;   // ~6.8 s: the rap section
-        for (int t = 0; t < ticks; ++t)
+        for (int t = 0; t < ticks + 60; ++t)
         {
+            if (t == ticks)
+            {
+                // then the doubles and the imager at work, with the IMAGER tab open
+                auto set = [&] (const char* id, float v) { if (auto* prm = p.apvts.getParameter (id)) prm->setValueNotifyingHost (prm->convertTo0to1 (v)); };
+                set ("glassRepeats", 0.35f); set ("glassSync", 4.0f); set ("glassFloat", 12.0f); set ("foldAttack", -0.6f);
+                set ("imgW1", -0.8f); set ("imgW3", 0.4f); set ("imgW4", 0.9f); set ("imgS2", 0.4f); set ("imgRecover", 0.5f);
+                editor.selectPage (7);
+            }
             for (int c = 0; c < 2; ++c)
                 for (int i = 0; i < 1600; ++i)
                 {
@@ -272,7 +303,12 @@ int main (int argc, char** argv)
         snap ("large_4");
         editor.selectPage (5);
         snap ("large_5");
-        check (ok, "editor renders all six pages to images (small, base and large size)");
+        editor.selectPage (6);
+        snap ("large_6");
+        editor.selectPage (7);
+        snap ("large_7");
+        check (ok, "editor renders all eight pages to images (small, base and large size)");
+        check (p.engine.isImagerActive(), "the imager is engaged once a band is moved");
 
         // a 2x (4K / Retina) screen at the largest size: the textures follow the real pixel density
         {

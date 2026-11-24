@@ -830,6 +830,358 @@ static int testFlange()
 }
 
 //==============================================================================
+// THE DOUBLES: fine controls. Renders aligned to the plugin's latency (output i = what came in at i).
+static std::vector<std::vector<float>> renderAligned (const float* v, const std::vector<std::vector<float>>& in, double sr, double bpm,
+                                                      const std::function<void (Engine&, size_t)>& perBlock = {})
+{
+    Engine e; e.prepare (sr, (int) in.size()); e.setParams (v);
+    std::vector<std::vector<float>> io = in;
+    const size_t lat0 = (size_t) e.getLatency();
+    for (auto& c : io) c.resize (c.size() + lat0, 0.0f);
+    runEngine (e, io, sr, bpm, 512, [&] (size_t pos) { if (perBlock) perBlock (e, pos); });
+    const size_t lat = (size_t) e.getLatency();
+    std::vector<std::vector<float>> out (in.size(), std::vector<float> (in[0].size(), 0.0f));
+    for (size_t c = 0; c < in.size(); ++c)
+        for (size_t i = 0; i < in[0].size() && i + lat < io[c].size(); ++i)
+            out[c][i] = io[c][i + lat];
+    return out;
+}
+
+static void doublesParams (float* v, bool glass)
+{
+    linearParams (v);
+    v[P_LAMP] = 0.0f; v[P_GLASS] = glass ? 1.0f : 0.0f; v[P_FOLD] = glass ? 0.0f : 1.0f;
+    v[P_ENSEMBLE] = 0.0f; v[P_PULSE] = 0.0f; v[P_ORBIT] = 0.0f; v[P_VIBRATO] = 0.0f; v[P_WIDTH] = 0.0f;
+    v[P_AUTOGAIN] = 0.0f;
+}
+
+// where the burst comes out (ms after it went in): the peak of the cross-correlation with the burst
+static std::vector<double> burstEchoes (const std::vector<float>& y, const std::vector<float>& burst, size_t at, double sr, int count, double minGapMs)
+{
+    std::vector<double> corr (y.size(), 0.0);
+    for (size_t i = at; i + burst.size() < y.size(); ++i)
+    {
+        double a = 0.0;
+        for (size_t k = 0; k < burst.size(); ++k) a += (double) y[i + k] * burst[k];
+        corr[i] = std::fabs (a);
+    }
+    std::vector<double> res;   // pairs: delay ms, peak
+    std::vector<bool> taken (y.size(), false);
+    for (int c = 0; c < count; ++c)
+    {
+        size_t best = 0; double bv = 0.0;
+        for (size_t i = at; i < corr.size(); ++i)
+            if (! taken[i] && corr[i] > bv) { bv = corr[i]; best = i; }
+        if (bv <= 0.0) break;
+        res.push_back ((double) (best - at) / sr * 1000.0);
+        res.push_back (bv);
+        const size_t g = (size_t) (minGapMs * 0.001 * sr);
+        for (size_t i = best > g ? best - g : 0; i < std::min (corr.size(), best + g); ++i) taken[i] = true;
+    }
+    return res;
+}
+
+static double bandPower (const std::vector<float>& x, size_t start, double sr, double f1, double f2)
+{
+    const size_t N = 65536;
+    std::vector<double> w (N);
+    for (size_t i = 0; i < N; ++i) w[i] = (start + i < x.size() ? x[start + i] : 0.0f) * (0.5 - 0.5 * std::cos (2 * kPiD * i / (N - 1)));
+    std::vector<double> mag; fftMag (w, mag);
+    double p = 0.0;
+    for (size_t k = (size_t) (f1 / sr * N); k <= (size_t) (f2 / sr * N) && k < mag.size(); ++k) p += mag[k];
+    return p + 1.0e-30;
+}
+
+static double pitchSpanCents (const std::vector<float>& y, size_t from, size_t to, double sr, double f0)
+{
+    // instantaneous pitch from zero crossings, averaged over 8 periods
+    std::vector<double> zc;
+    for (size_t i = from + 1; i < to; ++i)
+        if (y[i - 1] < 0.0f && y[i] >= 0.0f)
+            zc.push_back ((double) (i - 1) + (double) (-y[i - 1]) / (double) (y[i] - y[i - 1]));
+    double lo = 1e9, hi = -1e9;
+    for (size_t k = 8; k < zc.size(); ++k)
+    {
+        const double f = 8.0 * sr / (zc[k] - zc[k - 8]);
+        const double c = 1200.0 * std::log2 (f / f0);
+        lo = std::min (lo, c); hi = std::max (hi, c);
+    }
+    return hi - lo;
+}
+
+static int testDoubles()
+{
+    const double sr = 48000.0, bpm = 120.0;
+    bool ok = true;
+    // a short 1 kHz burst, alone in the silence
+    std::vector<float> burst ((size_t) (0.004 * sr));
+    for (size_t i = 0; i < burst.size(); ++i)
+        burst[i] = (float) (0.25 * std::sin (2 * kPiD * 1000.0 * i / sr) * (0.5 - 0.5 * std::cos (2 * kPiD * i / (burst.size() - 1))));
+    const size_t at = (size_t) (0.25 * sr);
+    std::vector<std::vector<float>> in (1, std::vector<float> ((size_t) (1.2 * sr), 0.0f));
+    std::copy (burst.begin(), burst.end(), in[0].begin() + (long) at);
+
+    auto timeOf = [&] (bool glass, float timeMs, float sync, float repeats, int count)
+    {
+        float v[P_COUNT]; doublesParams (v, glass);
+        v[glass ? P_GTIME : P_FTIME] = timeMs; v[glass ? P_GSYNC : P_FSYNC] = sync; v[glass ? P_GREPEATS : P_FREPEATS] = repeats;
+        auto out = renderAligned (v, in, sr, bpm);
+        return burstEchoes (out[0], burst, at, sr, count, 20.0);
+    };
+    {
+        const auto g = timeOf (true, 80.0f, 0.0f, 0.0f, 1), f = timeOf (false, 50.0f, 0.0f, 0.0f, 1);
+        const auto gs = timeOf (true, 23.0f, 4.0f, 0.0f, 1);   // 1/16 at 120 bpm = 125 ms
+        std::printf ("  Glass Time 80 ms: the double comes %.2f ms after the voice\n", g[0]);
+        std::printf ("  Fold Time 50 ms: %.2f ms\n", f[0]);
+        std::printf ("  Glass Sync 1/16 at 120 bpm (125 ms): %.2f ms\n", gs[0]);
+        ok = ok && std::fabs (g[0] - 80.0) < 1.0 && std::fabs (f[0] - 50.0) < 1.0 && std::fabs (gs[0] - 125.0) < 1.0;
+    }
+    {
+        const auto r = timeOf (true, 60.0f, 0.0f, 0.6f, 3);
+        std::vector<std::pair<double, double>> e;
+        for (size_t i = 0; i + 1 < r.size(); i += 2) e.push_back ({ r[i], r[i + 1] });
+        std::sort (e.begin(), e.end());
+        std::printf ("  Glass Repeats 60%%, 60 ms: repeats at");
+        for (auto& p : e) std::printf (" %.1f", p.first);
+        std::printf (" ms, each %.2f / %.2f of the one before\n", e.size() > 1 ? e[1].second / e[0].second : 0.0,
+                     e.size() > 2 ? e[2].second / e[1].second : 0.0);
+        ok = ok && e.size() == 3 && std::fabs (e[1].first - 120.0) < 1.5 && std::fabs (e[2].first - 180.0) < 2.0
+                && e[1].second / e[0].second > 0.45 && e[1].second / e[0].second < 0.75
+                && e[2].second / e[1].second > 0.45 && e[2].second / e[1].second < 0.75;
+    }
+    {
+        // ATTACK / OPEN: syllables with hard onsets; the double's first 25 ms against its sustain
+        std::vector<std::vector<float>> syl (1, std::vector<float> ((size_t) (2.0 * sr), 0.0f));
+        for (int s = 0; s < 3; ++s)
+            for (size_t i = 0; i < (size_t) (0.25 * sr); ++i)
+            {
+                const double t = (double) i / sr;
+                double x = 0.0;
+                for (int h = 1; h <= 8; ++h) x += std::sin (2 * kPiD * 220.0 * h * t) / h;
+                syl[0][(size_t) ((0.2 + 0.55 * s) * sr) + i] = (float) (0.2 * x * std::min (1.0, t / 0.002) * std::min (1.0, (0.25 - t) / 0.01));
+            }
+        auto ratio = [&] (float attack)
+        {
+            float v[P_COUNT]; doublesParams (v, true);
+            v[P_GTIME] = 30.0f; v[P_GATTACK] = attack; v[P_GOPEN] = 120.0f;
+            auto out = renderAligned (v, syl, sr, bpm);
+            double early = 0.0, late = 0.0;
+            for (int s = 1; s < 3; ++s)
+            {
+                const size_t on = (size_t) ((0.2 + 0.55 * s + 0.030) * sr);
+                for (size_t i = 0; i < (size_t) (0.025 * sr); ++i) early += out[0][on + i] * out[0][on + i];
+                for (size_t i = (size_t) (0.18 * sr); i < (size_t) (0.205 * sr); ++i) late += out[0][on + i] * out[0][on + i];
+            }
+            return 10.0 * std::log10 ((early + 1e-30) / (late + 1e-30));
+        };
+        const double r0 = ratio (0.0f), rSkip = ratio (-1.0f), rHit = ratio (1.0f);
+        std::printf ("  Glass Attack: first 25 ms vs the sustain: %+.1f dB normal, %+.1f dB at -100%% (skips the attack), "
+                     "%+.1f dB at +100%% (grabs it)\n", r0, rSkip, rHit);
+        ok = ok && rSkip < r0 - 8.0 && rHit > r0 + 4.0;
+    }
+    {
+        // TONE: noise through the double, the top against the bottom
+        std::vector<std::vector<float>> nz (1, std::vector<float> ((size_t) (2.0 * sr)));
+        std::mt19937 rng (11); std::normal_distribution<float> G (0.0f, 0.05f);
+        for (auto& x : nz[0]) x = G (rng);
+        auto tilt = [&] (float tone)
+        {
+            float v[P_COUNT]; doublesParams (v, true);
+            v[P_GTONE] = tone;
+            auto out = renderAligned (v, nz, sr, bpm);
+            return 10.0 * std::log10 (bandPower (out[0], (size_t) (0.4 * sr), sr, 4000.0, 8000.0)
+                                      / bandPower (out[0], (size_t) (0.4 * sr), sr, 200.0, 400.0));
+        };
+        const double t0 = tilt (0.0f), tDark = tilt (-1.0f), tBright = tilt (1.0f);
+        std::printf ("  Glass Tone: 4-8 kHz vs 200-400 Hz: %+.1f dB flat, %+.1f dB dark, %+.1f dB bright\n", t0, tDark, tBright);
+        ok = ok && tDark < t0 - 10.0 && tBright > t0 + 10.0;
+    }
+    {
+        // FLOAT: a steady tone floats around its pitch
+        std::vector<std::vector<float>> sn (1, std::vector<float> ((size_t) (2.5 * sr)));
+        for (size_t i = 0; i < sn[0].size(); ++i) sn[0][i] = (float) (0.2 * std::sin (2 * kPiD * 440.0 * i / sr));
+        auto span = [&] (float cents)
+        {
+            float v[P_COUNT]; doublesParams (v, true);
+            v[P_GFLOAT] = cents; v[P_GRATE] = 1.0f;
+            auto out = renderAligned (v, sn, sr, bpm);
+            return pitchSpanCents (out[0], (size_t) (0.5 * sr), (size_t) (2.4 * sr), sr, 440.0);
+        };
+        const double s0 = span (0.0f), s30 = span (30.0f);
+        std::printf ("  Glass Float 30 ct at 1 Hz: the pitch swings %.1f ct peak to peak (%.1f ct without float)\n", s30, s0);
+        ok = ok && s0 < 6.0 && s30 > 40.0 && s30 < 80.0;
+    }
+    {
+        // DRIVE: the double's own drive
+        std::vector<std::vector<float>> sn (1, std::vector<float> ((size_t) (1.5 * sr)));
+        for (size_t i = 0; i < sn[0].size(); ++i) sn[0][i] = (float) (0.3 * std::sin (2 * kPiD * 220.0 * i / sr));
+        auto thd = [&] (float db)
+        {
+            float v[P_COUNT]; doublesParams (v, true);
+            v[P_DRIVE] = 0.15f; v[P_GDRIVE] = db;
+            auto out = renderAligned (v, sn, sr, bpm);
+            const double f = bandPower (out[0], (size_t) (0.3 * sr), sr, 200.0, 240.0);
+            return 10.0 * std::log10 ((bandPower (out[0], (size_t) (0.3 * sr), sr, 400.0, 2400.0) + 1e-30) / f);
+        };
+        const double d0 = thd (0.0f), d12 = thd (12.0f), dm12 = thd (-12.0f), d6 = thd (6.0f), dm6 = thd (-6.0f);
+        std::printf ("  Glass Drive: harmonics vs fundamental %+.1f dB at -12 dB, %+.1f at -6, %+.1f dB at 0, %+.1f at +6, %+.1f dB at +12 dB\n", dm12, dm6, d0, d6, d12);
+        ok = ok && d12 > d0 + 8.0 && dm12 < d0 - 8.0;
+    }
+    {
+        // FOLD THROW: Fold gets its own doppler
+        std::vector<std::vector<float>> sn (1, std::vector<float> ((size_t) (1.5 * sr)));
+        for (size_t i = 0; i < sn[0].size(); ++i)
+            sn[0][i] = (float) (0.3 * std::sin (2 * kPiD * 220.0 * i / sr) * (0.6 + 0.4 * std::sin (2 * kPiD * 3.0 * i / sr)));
+        float v[P_COUNT]; doublesParams (v, false); v[P_DRIVE] = 0.3f;
+        const auto a = renderAligned (v, sn, sr, bpm);
+        v[P_FTHROW] = 1.0f;
+        const auto b = renderAligned (v, sn, sr, bpm);
+        double d = 0.0, p = 0.0;
+        for (size_t i = (size_t) (0.3 * sr); i < a[0].size(); ++i) { d += (a[0][i] - b[0][i]) * (a[0][i] - b[0][i]); p += a[0][i] * a[0][i]; }
+        const double rel = 10.0 * std::log10 ((d + 1e-30) / (p + 1e-30));
+        bool finite = true;
+        for (float x : b[0]) finite = finite && std::isfinite (x);
+        std::printf ("  Fold Throw 100%%: the fold double moves (difference %+.1f dB re the double)\n", rel);
+        ok = ok && finite && rel > -30.0;
+    }
+    std::printf (ok ? "DOUBLES: OK (time, sync, repeats, attack, tone, float, drive, throw)\n" : "DOUBLES: CHECK\n");
+    return ok ? 0 : 1;
+}
+
+//==============================================================================
+// IMAGER: the width of the wet sound in four bands
+static int testImager()
+{
+    const double sr = 48000.0, bpm = 120.0;
+    bool ok = true;
+    const size_t n = (size_t) (3.0 * sr), at = (size_t) (1.0 * sr);
+    std::mt19937 rng (21); std::normal_distribution<float> G (0.0f, 0.05f);
+    std::vector<float> n1 (n), n2 (n);
+    for (auto& x : n1) x = G (rng);
+    for (auto& x : n2) x = G (rng);
+    std::vector<std::vector<float>> wide (2, std::vector<float> (n)), mono (2, n1), apart (2);
+    for (size_t i = 0; i < n; ++i) { wide[0][i] = n1[i]; wide[1][i] = 0.6f * n1[i] + 0.8f * n2[i]; }
+    apart[0] = n1; apart[1] = n2;
+    auto ms = [] (const std::vector<std::vector<float>>& y, std::vector<float>& m, std::vector<float>& s)
+    {
+        m.resize (y[0].size()); s.resize (y[0].size());
+        for (size_t i = 0; i < m.size(); ++i) { m[i] = 0.5f * (y[0][i] + y[1][i]); s[i] = 0.5f * (y[0][i] - y[1][i]); }
+    };
+    auto db = [] (double a, double b) { return 10.0 * std::log10 (a / b); };
+    const double bands[4][2] = { { 30.0, 70.0 }, { 380.0, 560.0 }, { 2200.0, 3200.0 }, { 10000.0, 14000.0 } };
+
+    float base[P_COUNT]; linearParams (base); base[P_AUTOGAIN] = 0.0f;
+    {
+        // widths -100 / +50 / -50 / +100 %: the side follows, the mid (the mono sum) does not move
+        const auto off = renderAligned (base, wide, sr, bpm);
+        float v[P_COUNT]; std::copy (base, base + P_COUNT, v);
+        v[P_IW1] = -1.0f; v[P_IW2] = 0.5f; v[P_IW3] = -0.5f; v[P_IW4] = 1.0f;
+        const auto on = renderAligned (v, wide, sr, bpm);
+        std::vector<float> m0, s0, m1, s1; ms (off, m0, s0); ms (on, m1, s1);
+        // what the ideal (analog) Linkwitz-Riley tree of the same settings gives, averaged over the band like the noise is
+        const double xs[3] = { 180.0, 1200.0, 5500.0 }, gs[4] = { 0.0, 1.5, 0.5, 2.0 };
+        auto ideal = [&] (double f1, double f2)
+        {
+            using Cx = std::complex<double>;
+            auto bw = [] (double f, double fc, bool hp) { const Cx q (0.0, f / fc); const Cx d = q * q + std::sqrt (2.0) * q + 1.0; return hp ? q * q / d : 1.0 / d; };
+            auto lr = [&] (double f, double fc, bool hp) { const Cx b = bw (f, fc, hp); return b * b; };
+            double acc = 0.0;
+            for (int i = 0; i < 64; ++i)
+            {
+                const double f = f1 + (f2 - f1) * (i + 0.5) / 64.0;
+                const Cx b1 = lr (f, xs[0], false), r1 = lr (f, xs[0], true);
+                const Cx b2 = r1 * lr (f, xs[1], false), r2 = r1 * lr (f, xs[1], true);
+                const Cx b3 = r2 * lr (f, xs[2], false), b4 = r2 * lr (f, xs[2], true);
+                const Cx ap1 = lr (f, xs[1], false) + lr (f, xs[1], true), ap2 = lr (f, xs[2], false) + lr (f, xs[2], true);
+                acc += std::norm ((ap1 * gs[0] * b1 + gs[1] * b2) * ap2 + gs[2] * b3 + gs[3] * b4);
+            }
+            return 10.0 * std::log10 (acc / 64.0 + 1e-30);
+        };
+        std::printf ("  widths -100 / +50 / -50 / +100 %%:\n");
+        for (int b = 0; b < 4; ++b)
+        {
+            const double dm = db (bandPower (m1, at, sr, bands[b][0], bands[b][1]), bandPower (m0, at, sr, bands[b][0], bands[b][1]));
+            const double ds = db (bandPower (s1, at, sr, bands[b][0], bands[b][1]), bandPower (s0, at, sr, bands[b][0], bands[b][1]));
+            const double want = ideal (bands[b][0], bands[b][1]);
+            std::printf ("    %5.0f-%5.0f Hz: side %+6.1f dB (ideal Linkwitz-Riley %+6.1f), mono sum %+.2f dB\n", bands[b][0], bands[b][1],
+                         ds, want, dm);
+            ok = ok && std::fabs (dm) < 0.25 && (b == 0 ? ds < -25.0 : std::fabs (ds - want) < 0.75);
+        }
+    }
+    {
+        // SPREAD on a mono source: width appears in its band only, the mono sum stays
+        const auto off = renderAligned (base, mono, sr, bpm);
+        float v[P_COUNT]; std::copy (base, base + P_COUNT, v);
+        v[P_IS4] = 1.0f;
+        const auto on = renderAligned (v, mono, sr, bpm);
+        std::vector<float> m0, s0, m1, s1; ms (off, m0, s0); ms (on, m1, s1);
+        const double sHigh = db (bandPower (s1, at, sr, 10000.0, 14000.0), bandPower (m1, at, sr, 10000.0, 14000.0));
+        const double sLow = db (bandPower (s1, at, sr, 30.0, 70.0), bandPower (m1, at, sr, 30.0, 70.0));
+        double worstM = 0.0;
+        for (auto& b : bands)
+            worstM = std::max (worstM, std::fabs (db (bandPower (m1, at, sr, b[0], b[1]), bandPower (m0, at, sr, b[0], b[1]))));
+        std::printf ("  Spread 100%% (high band) on a mono voice: side %+.1f dB re mid up high, %+.1f dB in the lows; "
+                     "mono sum moves %.2f dB at most\n", sHigh, sLow, worstM);
+        ok = ok && sHigh > -5.0 && sHigh < -1.5 && sLow < -30.0 && worstM < 0.25;
+    }
+    {
+        // RECOVER: a band narrowed to mono gets its side back in the middle
+        const auto off = renderAligned (base, apart, sr, bpm);
+        float v[P_COUNT]; std::copy (base, base + P_COUNT, v);
+        v[P_IW2] = -1.0f;
+        const auto narrow = renderAligned (v, apart, sr, bpm);
+        v[P_IRECOVER] = 1.0f;
+        const auto rec = renderAligned (v, apart, sr, bpm);
+        std::vector<float> m0, s0, m1, s1, m2, s2; ms (off, m0, s0); ms (narrow, m1, s1); ms (rec, m2, s2);
+        const double side = db (bandPower (s2, at, sr, 380.0, 560.0), bandPower (s0, at, sr, 380.0, 560.0));
+        const double body = db (bandPower (m2, at, sr, 380.0, 560.0), bandPower (m0, at, sr, 380.0, 560.0));
+        const double bodyN = db (bandPower (m1, at, sr, 380.0, 560.0), bandPower (m0, at, sr, 380.0, 560.0));
+        const double top = db (bandPower (m2, at, sr, 10000.0, 14000.0), bandPower (m0, at, sr, 10000.0, 14000.0));
+        std::printf ("  Recover 100%%, low mids at mono: side %+.1f dB, mid %+.2f dB (%+.2f dB without Recover), up high %+.2f dB\n",
+                     side, body, bodyN, top);
+        ok = ok && side < -20.0 && body > 1.0 && body < 2.5 && std::fabs (bodyN) < 0.25 && std::fabs (top) < 0.25;
+    }
+    {
+        // the dry gets the same all-pass: at 50 % mix the imager must not comb the dry against the wet
+        float v0[P_COUNT]; std::copy (base, base + P_COUNT, v0); v0[P_MIX] = 0.5f;
+        const auto off = renderAligned (v0, wide, sr, bpm);
+        float v[P_COUNT]; std::copy (v0, v0 + P_COUNT, v); v[P_IW4] = 0.001f;
+        const auto on = renderAligned (v, wide, sr, bpm);
+        double worst = 0.0;
+        const double around[3][2] = { { 150.0, 210.0 }, { 1000.0, 1400.0 }, { 4700.0, 6300.0 } };
+        for (auto& b : around)
+            for (int c = 0; c < 2; ++c)
+                worst = std::max (worst, std::fabs (db (bandPower (on[(size_t) c], at, sr, b[0], b[1]), bandPower (off[(size_t) c], at, sr, b[0], b[1]))));
+        std::printf ("  50%% mix, imager engaged at neutral: the crossovers move the sound by %.2f dB at most (no comb)\n", worst);
+        ok = ok && worst < 0.3;
+    }
+    {
+        // back to neutral: after its second of grace and the fade, the imager is gone without a trace
+        const auto off = renderAligned (base, wide, sr, bpm);
+        float v[P_COUNT]; std::copy (base, base + P_COUNT, v);
+        v[P_IW1] = -1.0f; v[P_IW4] = 0.8f; v[P_IS3] = 0.5f; v[P_IRECOVER] = 0.7f;
+        const auto back = renderAligned (v, wide, sr, bpm, [&] (Engine& e, size_t pos)
+        {
+            if (pos >= (size_t) (0.6 * sr) && pos < (size_t) (0.6 * sr) + 512) { e.setParams (base); }
+        });
+        double d = 0.0;
+        for (size_t c = 0; c < 2; ++c)
+            for (size_t i = (size_t) (2.0 * sr); i < n; ++i)
+                d = std::max (d, (double) std::fabs (back[c][i] - off[c][i]));
+        // a mono track: nothing to widen, nothing changes
+        std::vector<std::vector<float>> one (1, n1);
+        const auto mOff = renderAligned (base, one, sr, bpm);
+        const auto mOn = renderAligned (v, one, sr, bpm);
+        double dm = 0.0;
+        for (size_t i = 0; i < n; ++i) dm = std::max (dm, (double) std::fabs (mOn[0][i] - mOff[0][i]));
+        std::printf ("  back to neutral: %.3g max difference after 1.4 s; a mono track: %.3g\n", d, dm);
+        ok = ok && d == 0.0 && dm == 0.0;
+    }
+    std::printf (ok ? "IMAGER: OK (widths, spread, recover, the mono sum never moves)\n" : "IMAGER: CHECK\n");
+    return ok ? 0 : 1;
+}
+
+//==============================================================================
 static int findPreset (const std::string& s)
 {
     int count = 0; const Preset* p = factoryPresets (count);
@@ -964,6 +1316,8 @@ int main (int argc, char** argv)
     if (cmd == "melodic" || cmd == "clipkey") return testMelodic();
     if (cmd == "reverbsafe") return testReverbSafe();
     if (cmd == "tuning") return testTuning();
+    if (cmd == "doubles") return testDoubles();
+    if (cmd == "imager") return testImager();
     double bpm = 95.0; std::vector<std::string> sets;
     std::vector<std::string> pos;
     for (int i = 2; i < argc; ++i)

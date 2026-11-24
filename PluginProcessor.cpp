@@ -15,10 +15,13 @@ juce::String MavkaAudioProcessor::formatValue (Unit unit, float v)
         case Unit::Slant:   return v > 0.004f ? "Scoop " + pct (v) : (v < -0.004f ? "Fall " + pct (-v) : juce::String ("Off"));
         case Unit::Tone:    return v > 0.004f ? "Bright " + pct (v) : (v < -0.004f ? "Dark " + pct (-v) : juce::String ("Neutral"));
         case Unit::Db:      return (v > 0.04f ? "+" : "") + juce::String (v, 1) + " dB";
-        case Unit::Hz:      return v < 1000.0f ? juce::String (juce::roundToInt (v)) + " Hz" : juce::String (v / 1000.0f, 1) + " kHz";
-        case Unit::Ms:      return juce::String (juce::roundToInt (v)) + " ms";
+        case Unit::Hz:      return v < 9.995f ? juce::String (v, 2) + " Hz"
+                                   : (v < 1000.0f ? juce::String (juce::roundToInt (v)) + " Hz" : juce::String (v / 1000.0f, 1) + " kHz");
+        case Unit::Ms:      return v < 99.95f ? juce::String (v, 1) + " ms" : juce::String (juce::roundToInt (v)) + " ms";
+        case Unit::Ct:      return juce::String (v, 1) + " ct";
         case Unit::Sec:     return juce::String (v, v < 10.0f ? 2 : 1) + " s";
         case Unit::Cents:   return juce::String (detuneToA4 (v), 1) + " Hz";
+        case Unit::Door:    return v > 0.004f ? "Grab " + pct (v) : (v < -0.004f ? "Skip " + pct (-v) : juce::String ("Natural"));
         case Unit::None:    break;
     }
     return juce::String (v, 2);
@@ -35,7 +38,9 @@ static float parseValue (Unit unit, const juce::String& text)
         case Unit::Ink:     return (t.contains ("press") ? -std::abs (x) : x) / 100.0f;
         case Unit::Slant:   return (t.contains ("fall") ? -std::abs (x) : x) / 100.0f;
         case Unit::Tone:    return (t.contains ("dark") ? -std::abs (x) : x) / 100.0f;
+        case Unit::Door:    return (t.contains ("skip") ? -std::abs (x) : (t.contains ("grab") ? std::abs (x) : x)) / 100.0f;
         case Unit::Hz:      return t.contains ("k") ? x * 1000.0f : x;
+        case Unit::Ct:      return juce::jmax (0.0f, x);
         case Unit::Cents:   // "447", "447 Hz", "432.5hz" = A4 in Hz; "+27.3", "-12 ct", "15 cents" = cents
             if (t.contains ("hz") || (! t.contains ("c") && std::abs (x) > 200.0f))
                 return juce::jlimit (-100.0f, 100.0f, a4ToDetune (juce::jmax (x, 1.0f)));

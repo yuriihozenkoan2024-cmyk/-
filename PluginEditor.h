@@ -4,6 +4,7 @@
 
 #include <array>
 #include <atomic>
+#include <complex>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -255,11 +256,59 @@ public:
     float a4 = 440.0f;   // the tuning reference (Detune): note names follow it
 };
 
+// IMAGER tab: the width of MAVKA's wet sound across the spectrum. A stereo field like StageOne's - low at the bottom,
+// high at the top, left to right where it sounds - with the four bands on top of it like Ozone's Imager: drag a dashed
+// split up / down, drag inside a band left / right to narrow or widen it (Alt: its Spread), double-click to reset.
+class ImagerField final : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+    explicit ImagerField (juce::AudioProcessorValueTreeState& state) : apvts (state) {}
+    static constexpr int kRows = 52;
+    void setData (const float* preL, const float* preR, const float* postL, const float* postR, int n,
+                  double sampleRate, bool imagerActive, bool stereoTrack);
+    void paint (juce::Graphics&) override;
+    void mouseMove (const juce::MouseEvent&) override;
+    void mouseExit (const juce::MouseEvent&) override;
+    void mouseDown (const juce::MouseEvent&) override;
+    void mouseDrag (const juce::MouseEvent&) override;
+    void mouseUp (const juce::MouseEvent&) override;
+    void mouseDoubleClick (const juce::MouseEvent&) override;
+
+private:
+    // per row of frequencies: the loudness (fast up, slow down) and the powers of left / right / mid / side, averaged
+    // over a few frames so that the place and the width of the sound read steadily
+    struct Row
+    {
+        float db = -150.0f;
+        double pl = 0.0, pr = 0.0, pm = 0.0, ps = 0.0;
+        float pan() const noexcept   { return (float) ((pr - pl) / (pr + pl + 1.0e-20)); }
+        float width() const noexcept { return (float) (ps / (pm + ps + 1.0e-20)); }
+    };
+    juce::Rectangle<float> plot() const;
+    float yOf (float hz) const;
+    float hzAt (float y) const;
+    void splits (float* x) const;                  // the three crossovers as the engine uses them
+    float value (const juce::String& id) const;
+    void setValue (const juce::String& id, float v);
+    juce::String idFor (int target) const;
+    int targetAt (juce::Point<float> p, bool alt) const;   // 0..2 split, 3..6 width of a band, 7..10 its spread, -1
+    juce::AudioProcessorValueTreeState& apvts;
+    std::array<Row, kRows> pre {}, post {};
+    std::vector<std::complex<float>> spec[4];
+    std::vector<float> window;
+    float peakDb = -150.0f;
+    bool active = false, stereo = true, hasData = false;
+    int hover = -1, drag = -1;
+    float dragFrom = 0.0f, dragX = 0.0f, dragY = 0.0f;
+};
+
 struct Page final : public juce::Component
 {
     juce::String description, notes;   // notes: a few printed lines (one per line) inside notesArea
     juce::Rectangle<int> notesArea;
-    int dividerX = 0;                  // a hairline between two groups of controls
+    int dividerX = 0, dividerTop = 52; // a hairline between two groups of controls
+    struct Label { juce::String text, sub; juce::Rectangle<int> area; bool vertical = false; };
+    std::vector<Label> labels;         // row names (DOUBLES: Glass / Fold, IMAGER: Width / Spread)
     void paint (juce::Graphics&) override;
 };
 
@@ -307,7 +356,7 @@ public:
     void selectPage (int index);
     void updateTextures (bool synchronous);   // match the texture resolution to the screen (sync: for tests)
     float getTextureLevel() const noexcept { return texLevel; }
-    static constexpr int numPages = 6;
+    static constexpr int numPages = 8;
 
 private:
     void timerCallback() override;
@@ -338,8 +387,9 @@ private:
     mavkaui::ClipCurve clipCurve { proc.apvts };
     mavkaui::ClipScope clipScope;
     mavkaui::OvertoneMap overtoneMap { proc.apvts };
+    mavkaui::ImagerField imagerField { proc.apvts };
     int currentPage = 0;
-    std::vector<float> scopeIn, scopeOut;
+    std::vector<float> scopeIn, scopeOut, imgBuf[4];
     std::array<juce::TextButton, numPages> tabs;
     std::array<mavkaui::Page, numPages> pages;
 

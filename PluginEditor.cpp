@@ -2104,13 +2104,423 @@ void OvertoneMap::mouseDoubleClick (const juce::MouseEvent& e)
     repaint();
 }
 
+
+//==============================================================================
+namespace
+{
+    void fftInPlace (std::vector<std::complex<float>>& a)
+    {
+        const size_t n = a.size();
+        for (size_t i = 1, j = 0; i < n; ++i)
+        {
+            size_t bit = n >> 1;
+            for (; j & bit; bit >>= 1) j ^= bit;
+            j ^= bit;
+            if (i < j) std::swap (a[i], a[j]);
+        }
+        for (size_t len = 2; len <= n; len <<= 1)
+        {
+            const double ang = -2.0 * juce::MathConstants<double>::pi / (double) len;
+            for (size_t i = 0; i < n; i += len)
+                for (size_t k = 0; k < len / 2; ++k)
+                {
+                    const std::complex<float> w ((float) std::cos (ang * (double) k), (float) std::sin (ang * (double) k));
+                    const auto u = a[i + k], t = a[i + k + len / 2] * w;
+                    a[i + k] = u + t;
+                    a[i + k + len / 2] = u - t;
+                }
+        }
+    }
+
+    constexpr float kImgLo = 30.0f, kImgHi = 18000.0f;
+    inline float imgRowHz (int i) { return kImgLo * std::pow (kImgHi / kImgLo, (float) i / (float) ImagerField::kRows); }
+    const char* const kBandNames[4] = { "LOW", "LOW MID", "HIGH MID", "HIGH" };
+}
+
+juce::Rectangle<float> ImagerField::plot() const
+{
+    return getLocalBounds().toFloat().withTrimmedLeft (24.0f).withTrimmedRight (5.0f).withTrimmedTop (5.0f).withTrimmedBottom (14.0f);
+}
+
+float ImagerField::yOf (float hz) const
+{
+    const auto p = plot();
+    const float t = std::log (juce::jlimit (kImgLo, kImgHi, hz) / kImgLo) / std::log (kImgHi / kImgLo);
+    return p.getBottom() - p.getHeight() * t;
+}
+
+float ImagerField::hzAt (float y) const
+{
+    const auto p = plot();
+    return kImgLo * std::pow (kImgHi / kImgLo, juce::jlimit (0.0f, 1.0f, (p.getBottom() - y) / p.getHeight()));
+}
+
+float ImagerField::value (const juce::String& id) const
+{
+    if (auto* v = apvts.getRawParameterValue (id)) return v->load();
+    return 0.0f;
+}
+
+void ImagerField::setValue (const juce::String& id, float v)
+{
+    if (auto* p = apvts.getParameter (id))
+        p->setValueNotifyingHost (p->convertTo0to1 (v));
+}
+
+void ImagerField::splits (float* x) const
+{
+    // as the engine uses them: at least a third of an octave apart
+    x[0] = value ("imgX1");
+    x[1] = juce::jmax (value ("imgX2"), x[0] * 1.26f);
+    x[2] = juce::jmax (value ("imgX3"), x[1] * 1.26f);
+}
+
+juce::String ImagerField::idFor (int t) const
+{
+    if (t < 0)  return {};
+    if (t < 3)  return "imgX" + juce::String (t + 1);
+    if (t < 7)  return "imgW" + juce::String (t - 2);
+    return "imgS" + juce::String (t - 6);
+}
+
+int ImagerField::targetAt (juce::Point<float> pt, bool alt) const
+{
+    const auto p = plot();
+    if (! p.expanded (0.0f, 3.0f).contains (pt))
+        return -1;
+    float xs[3];
+    splits (xs);
+    for (int i = 0; i < 3; ++i)
+        if (std::abs (pt.y - yOf (xs[i])) <= 4.0f)
+            return i;
+    const float hz = hzAt (pt.y);
+    const int band = hz < xs[0] ? 0 : (hz < xs[1] ? 1 : (hz < xs[2] ? 2 : 3));
+    return (alt ? 7 : 3) + band;
+}
+
+void ImagerField::setData (const float* preL, const float* preR, const float* postL, const float* postR, int n,
+                           double sampleRate, bool imagerActive, bool stereoTrack)
+{
+    active = imagerActive;
+    stereo = stereoTrack;
+    if (n < 64 || sampleRate <= 0.0)
+        return;
+    if ((int) window.size() != n)
+    {
+        window.resize ((size_t) n);
+        for (int i = 0; i < n; ++i)
+            window[(size_t) i] = 0.5f - 0.5f * std::cos (2.0f * juce::MathConstants<float>::pi * (float) i / (float) (n - 1));
+    }
+    const float* src[4] = { preL, preR, postL, postR };
+    for (int s = 0; s < 4; ++s)
+    {
+        auto& a = spec[s];
+        a.resize ((size_t) n);
+        for (int i = 0; i < n; ++i)
+            a[(size_t) i] = { src[s][i] * window[(size_t) i], 0.0f };
+        fftInPlace (a);
+    }
+    const float df = (float) sampleRate / (float) n;
+    float loudest = -150.0f;
+    for (int i = 0; i < kRows; ++i)
+    {
+        const int k1 = juce::jlimit (1, n / 2 - 1, (int) std::floor (imgRowHz (i) / df));
+        const int k2 = juce::jlimit (k1, n / 2 - 1, (int) std::ceil (imgRowHz (i + 1) / df) - 1);
+        for (int w = 0; w < 2; ++w)
+        {
+            const auto& L = spec[w * 2];
+            const auto& R = spec[w * 2 + 1];
+            double pl = 0.0, pr = 0.0, pm = 0.0, ps = 0.0;
+            for (int k = k1; k <= k2; ++k)
+            {
+                const auto l = L[(size_t) k], r = R[(size_t) k];
+                pl += std::norm (l);
+                pr += std::norm (r);
+                pm += 0.25 * std::norm (l + r);
+                ps += 0.25 * std::norm (l - r);
+            }
+            const float db = 10.0f * std::log10 ((float) (0.5 * (pl + pr)) + 1.0e-15f);
+            Row& q = (w == 0 ? pre : post)[(size_t) i];
+            const double a = hasData ? 0.22 : 1.0;
+            q.pl += a * (pl - q.pl);
+            q.pr += a * (pr - q.pr);
+            q.pm += a * (pm - q.pm);
+            q.ps += a * (ps - q.ps);
+            q.db = hasData ? q.db + (db > q.db ? 0.6f : 0.18f) * (db - q.db) : db;
+        }
+        loudest = juce::jmax (loudest, post[(size_t) i].db);
+    }
+    peakDb = hasData ? juce::jmax (loudest, peakDb - 0.35f) : loudest;
+    hasData = true;
+    repaint();
+}
+
+void ImagerField::paint (juce::Graphics& g)
+{
+    const auto r = getLocalBounds().toFloat();
+    recess (g, r);
+    const auto p = plot();
+    const float cx = p.getCentreX(), half = p.getWidth() * 0.5f;
+    float xs[3];
+    splits (xs);
+    const float edges[5] = { kImgLo, xs[0], xs[1], xs[2], kImgHi };
+    const int hb = drag >= 3 ? (drag - 3) % 4 : (hover >= 3 ? (hover - 3) % 4 : -1);
+    if (hb >= 0)
+    {
+        g.setColour (theme::ink.withAlpha (0.045f));
+        g.fillRect (juce::Rectangle<float>::leftTopRightBottom (p.getX(), yOf (edges[hb + 1]), p.getRight(), yOf (edges[hb])));
+    }
+
+    // the stereo field: the centre and the half-way lines; frequency rules on the left
+    g.setColour (theme::hair.withAlpha (0.85f));
+    g.drawLine (cx, p.getY(), cx, p.getBottom(), 0.7f);
+    g.setColour (theme::hair.withAlpha (0.4f));
+    for (float q : { -0.5f, 0.5f })
+        g.drawLine (cx + q * half, p.getY(), cx + q * half, p.getBottom(), 0.5f);
+    g.setFont (numbers (9.0f));
+    for (int fi = 0; fi < 8; ++fi)
+    {
+        static const float rules[8] = { 50.0f, 100.0f, 200.0f, 500.0f, 1000.0f, 2000.0f, 5000.0f, 10000.0f };
+        const float f = rules[fi];
+        const float y = yOf (f);
+        const bool major = fi == 1 || fi == 4 || fi == 7;
+        g.setColour (theme::hair.withAlpha (major ? 0.45f : 0.22f));
+        g.drawLine (p.getX(), y, p.getRight(), y, 0.5f);
+        g.setColour (major ? theme::inkSoft : theme::inkFaint);
+        g.drawText (f >= 1000.0f ? juce::String ((int) (f / 1000.0f)) + "k" : juce::String ((int) f),
+                    juce::Rectangle<float> (r.getX(), y - 6.0f, p.getX() - r.getX() - 3.0f, 12.0f), juce::Justification::centredRight, false);
+    }
+    g.setColour (theme::inkFaint);
+    g.setFont (sans (9.0f, true, 0.1f));
+    g.drawText ("L", juce::Rectangle<float> (p.getX(), p.getBottom() + 1.0f, 12.0f, 12.0f), juce::Justification::centredLeft, false);
+    g.drawText ("C", juce::Rectangle<float> (cx - 6.0f, p.getBottom() + 1.0f, 12.0f, 12.0f), juce::Justification::centred, false);
+    g.drawText ("R", juce::Rectangle<float> (p.getRight() - 12.0f, p.getBottom() + 1.0f, 12.0f, 12.0f), juce::Justification::centredRight, false);
+
+    // the sound: one ink stroke per row - its length is how wide those frequencies are, its darkness how loud,
+    // the dark tick where they sit
+    if (hasData)
+    {
+        auto extent = [&] (const Row& w, float& x1, float& x2)
+        {
+            const float e = 0.03f + 0.97f * std::sqrt (juce::jlimit (0.0f, 1.0f, w.width()));
+            const float c = juce::jlimit (-1.0f, 1.0f, w.pan()) * (1.0f - 0.7f * e);
+            x1 = juce::jmax (p.getX(), cx + (c - e) * half);
+            x2 = juce::jmin (p.getRight(), cx + (c + e) * half);
+        };
+        const float floorDb = -40.0f;   // about -94 dBFS
+        const float ref = juce::jmax (peakDb, floorDb + 30.0f);
+        for (int i = 0; i < kRows; ++i)
+        {
+            const float yT = yOf (imgRowHz (i + 1)), yB = yOf (imgRowHz (i));
+            const float h = juce::jmax (1.0f, yB - yT - 0.8f);
+            const auto& q = post[(size_t) i];
+            const float a = mavka::smoothstep (ref - 54.0f, ref - 6.0f, q.db) * mavka::smoothstep (floorDb, floorDb + 12.0f, q.db);
+            if (a < 0.01f)
+                continue;
+            float x1, x2;
+            extent (q, x1, x2);
+            // an ink smear: dense where the sound sits, thinning out to its edges
+            const float al = 0.1f + 0.62f * a;
+            juce::ColourGradient smear (theme::ink.withAlpha (al * 0.3f), x1, 0.0f, theme::ink.withAlpha (al * 0.3f), x2, 0.0f, false);
+            smear.addColour (0.5, theme::ink.withAlpha (al));
+            smear.addColour (0.3, theme::ink.withAlpha (al * 0.82f));
+            smear.addColour (0.7, theme::ink.withAlpha (al * 0.82f));
+            g.setGradientFill (smear);
+            g.fillRect (juce::Rectangle<float> (x1, yT + 0.4f, juce::jmax (1.0f, x2 - x1), h));
+            if (active)
+            {
+                // what the imager changed: blood where it widened, a hairline where the sound reached before
+                float p1, p2;
+                extent (pre[(size_t) i], p1, p2);
+                g.setColour (theme::blood.withAlpha (0.2f + 0.6f * a));
+                if (x1 < p1 - 0.5f) g.fillRect (juce::Rectangle<float> (x1, yT + 0.4f, p1 - x1, h));
+                if (x2 > p2 + 0.5f) g.fillRect (juce::Rectangle<float> (p2, yT + 0.4f, x2 - p2, h));
+                g.setColour (theme::inkSoft.withAlpha (0.3f + 0.45f * a));
+                const float ym = yT + 0.4f + h * 0.5f - 0.5f;
+                if (p1 < x1 - 0.5f) g.fillRect (juce::Rectangle<float> (p1, ym, x1 - p1, 1.0f));
+                if (p2 > x2 + 0.5f) g.fillRect (juce::Rectangle<float> (x2, ym, p2 - x2, 1.0f));
+            }
+        }
+    }
+
+    // the bands: brackets at their width, Spread as a dotted reach beyond them
+    for (int b = 0; b < 4; ++b)
+    {
+        const float yT = yOf (edges[b + 1]) + 3.0f, yB = yOf (edges[b]) - 3.0f;
+        if (yB - yT < 6.0f)
+            continue;
+        const float w = value ("imgW" + juce::String (b + 1)), sp = value ("imgS" + juce::String (b + 1));
+        const float e = 0.5f * (1.0f + w);
+        const bool hot = hb == b;
+        const float th = hot ? 1.7f : 1.1f;
+        g.setColour (hot ? theme::ink : theme::ink.withAlpha (0.62f));
+        for (int side = -1; side <= 1; side += 2)
+        {
+            const float sd = (float) side;
+            const float x = cx + sd * e * half;
+            g.fillRect (juce::Rectangle<float> (x - th * 0.5f, yT, th, yB - yT));
+            g.fillRect (juce::Rectangle<float> (side < 0 ? x : x - 4.0f, yT, 4.0f, th));
+            g.fillRect (juce::Rectangle<float> (side < 0 ? x : x - 4.0f, yB - th, 4.0f, th));
+            if (sp > 0.004f)
+            {
+                const float x2 = cx + sd * juce::jmin (1.0f, e + 0.5f * sp) * half, ym = 0.5f * (yT + yB);
+                for (float xx = x + sd * 3.0f; sd * (x2 - xx) > 0.0f; xx += sd * 3.0f)
+                    g.fillRect (juce::Rectangle<float> (xx - 0.6f, ym - 0.6f, 1.2f, 1.2f));
+                g.fillRect (juce::Rectangle<float> (x2 - 0.6f, ym - 3.0f, 1.2f, 6.0f));
+            }
+        }
+        juce::String t (kBandNames[b]);
+        if (std::abs (w) > 0.004f || hot)
+            t << "  " << (w > 0.004f ? "+" : "") << juce::String (juce::roundToInt (w * 100.0f)) << "%";
+        if (sp > 0.004f)
+            t << juce::String (u8 ("  \xc2\xb7  spread ")) << juce::String (juce::roundToInt (sp * 100.0f)) << "%";
+        const auto lf = sans (8.5f, true, 0.1f);
+        const auto tag = juce::Rectangle<float> (p.getX() + 1.0f, yT - 2.0f, juce::GlyphArrangement::getStringWidth (lf, t) + 8.0f, 11.0f);
+        g.setColour (theme::face.withAlpha (0.88f));
+        g.fillRect (tag);
+        g.setFont (lf);
+        g.setColour (hot ? theme::ink : theme::inkSoft);
+        g.drawText (t, tag.reduced (3.0f, 0.0f), juce::Justification::centredLeft, false);
+    }
+
+    // the splits
+    for (int i = 0; i < 3; ++i)
+    {
+        const float y = yOf (xs[i]);
+        const bool hot = hover == i || drag == i;
+        g.setColour (hot ? theme::ink : theme::inkSoft.withAlpha (0.7f));
+        const float dash[] = { 4.0f, 3.0f };
+        g.drawDashedLine (juce::Line<float> (p.getX(), y, p.getRight(), y), dash, 2, hot ? 1.4f : 0.9f);
+        const juce::String lbl = xs[i] < 1000.0f ? juce::String (juce::roundToInt (xs[i])) + " Hz"
+                                                 : juce::String (xs[i] / 1000.0f, xs[i] < 9950.0f ? 1 : 0) + " kHz";
+        const auto f = numbers (9.0f);
+        const float tw = juce::GlyphArrangement::getStringWidth (f, lbl) + 6.0f;
+        const auto box = juce::Rectangle<float> (p.getRight() - tw - 2.0f, y - 6.0f, tw, 12.0f);
+        g.setColour (theme::face.withAlpha (0.92f));
+        g.fillRect (box);
+        g.setColour (hot ? theme::ink : theme::inkSoft);
+        g.setFont (f);
+        g.drawText (lbl, box, juce::Justification::centred, false);
+    }
+
+    if (! stereo || ! active)
+    {
+        g.setFont (sans (9.0f, false, 0.04f));
+        g.setColour (theme::inkFaint);
+        g.drawText (! stereo ? "mono track: nothing to widen" : "neutral: the imager is out of the way",
+                    juce::Rectangle<float> (p.getRight() - 190.0f, p.getY() + 1.0f, 186.0f, 10.0f), juce::Justification::topRight, false);
+    }
+}
+
+void ImagerField::mouseMove (const juce::MouseEvent& e)
+{
+    const int t = targetAt (e.position, e.mods.isAltDown());
+    if (t != hover)
+    {
+        hover = t;
+        repaint();
+    }
+    setMouseCursor (t < 0 ? juce::MouseCursor::NormalCursor
+                          : (t < 3 ? juce::MouseCursor::UpDownResizeCursor : juce::MouseCursor::LeftRightResizeCursor));
+}
+
+void ImagerField::mouseExit (const juce::MouseEvent&)
+{
+    hover = -1;
+    repaint();
+}
+
+void ImagerField::mouseDown (const juce::MouseEvent& e)
+{
+    drag = targetAt (e.position, e.mods.isAltDown());
+    if (drag < 0)
+        return;
+    if (auto* p = apvts.getParameter (idFor (drag)))
+        p->beginChangeGesture();
+    dragFrom = value (idFor (drag));
+    dragX = e.position.x;
+    dragY = e.position.y;
+    repaint();
+}
+
+void ImagerField::mouseDrag (const juce::MouseEvent& e)
+{
+    if (drag < 0)
+        return;
+    const float fine = e.mods.isShiftDown() ? 0.25f : 1.0f;
+    if (drag < 3)
+    {
+        float xs[3];
+        splits (xs);
+        const float hz = dragFrom * std::pow (hzAt (e.position.y) / hzAt (dragY), fine);
+        const float lo = drag == 0 ? 40.0f : (drag == 1 ? juce::jmax (300.0f, xs[0] * 1.26f) : juce::jmax (1500.0f, xs[1] * 1.26f));
+        const float hi = drag == 0 ? juce::jmin (1000.0f, xs[1] / 1.26f) : (drag == 1 ? juce::jmin (6000.0f, xs[2] / 1.26f) : 18000.0f);
+        setValue (idFor (drag), juce::jlimit (lo, juce::jmax (lo, hi), hz));
+    }
+    else
+    {
+        // the bracket follows the mouse: outward = wider
+        const auto p = plot();
+        const float side = dragX >= p.getCentreX() ? 1.0f : -1.0f;
+        const float d = 2.0f * (e.position.x - dragX) * side / (p.getWidth() * 0.5f) * fine;
+        setValue (idFor (drag), drag < 7 ? juce::jlimit (-1.0f, 1.0f, dragFrom + d) : juce::jlimit (0.0f, 1.0f, dragFrom + d));
+    }
+    repaint();
+}
+
+void ImagerField::mouseUp (const juce::MouseEvent&)
+{
+    if (drag >= 0)
+        if (auto* p = apvts.getParameter (idFor (drag)))
+            p->endChangeGesture();
+    drag = -1;
+    repaint();
+}
+
+void ImagerField::mouseDoubleClick (const juce::MouseEvent& e)
+{
+    const int t = targetAt (e.position, e.mods.isAltDown());
+    if (t < 0)
+        return;
+    if (auto* p = apvts.getParameter (idFor (t)))
+    {
+        p->beginChangeGesture();
+        p->setValueNotifyingHost (p->getDefaultValue());
+        p->endChangeGesture();
+    }
+    repaint();
+}
+
 //==============================================================================
 void Page::paint (juce::Graphics& g)
 {
     if (dividerX > 0)
     {
         g.setColour (theme::hair);
-        g.drawLine ((float) dividerX + 0.5f, 52.0f, (float) dividerX + 0.5f, (float) getHeight() - 14.0f, 0.8f);
+        g.drawLine ((float) dividerX + 0.5f, (float) dividerTop, (float) dividerX + 0.5f, (float) getHeight() - 14.0f, 0.8f);
+    }
+    for (const auto& l : labels)
+    {
+        if (l.vertical)
+        {
+            juce::Graphics::ScopedSaveState state (g);
+            const auto c = l.area.toFloat().getCentre();
+            g.addTransform (juce::AffineTransform::rotation (-juce::MathConstants<float>::halfPi, c.x, c.y));
+            g.setColour (theme::ink.withAlpha (0.62f));
+            g.setFont (sans (9.5f, true, 0.22f));
+            g.drawText (l.text, juce::Rectangle<float> ((float) l.area.getHeight(), (float) l.area.getWidth()).withCentre (c),
+                        juce::Justification::centred, false);
+        }
+        else
+        {
+            const auto a = l.area.toFloat();
+            g.setColour (theme::ink.withAlpha (0.86f));
+            g.setFont (sans (11.5f, true, 0.16f));
+            g.drawText (l.text, a.withTrimmedBottom (a.getHeight() * 0.5f + 1.0f), juce::Justification::centredBottom, false);
+            g.setColour (theme::inkFaint);
+            g.setFont (sans (9.5f, false, 0.04f));
+            g.drawText (l.sub, a.withTrimmedTop (a.getHeight() * 0.5f + 1.0f), juce::Justification::centredTop, false);
+        }
     }
     g.setColour (theme::inkSoft);
     g.setFont (sans (12.0f));
@@ -2285,14 +2695,14 @@ MavkaAudioProcessorEditor::MavkaAudioProcessorEditor (MavkaAudioProcessor& p)
     surface.addAndMakeVisible (clock);
 
     // ---- tabs
-    const char* tabNames[numPages] = { "HARDWARE", "CLOCK", "HARP", "VOICE", "FLANGE", "CLIP" };
+    const char* tabNames[numPages] = { "HARDWARE", "CLOCK", "HARP", "VOICE", "FLANGE", "CLIP", "DOUBLES", "IMAGER" };
     for (int i = 0; i < numPages; ++i)
     {
         auto& t = tabs[(size_t) i];
         t.setButtonText (u8 (tabNames[i]));
         t.setClickingTogglesState (true);
         t.setRadioGroupId (4242);
-        t.setBounds (284 + i * 126, 332, 122, 28);
+        t.setBounds (284 + juce::roundToInt ((float) i * 94.5f), 332, 92, 28);
         t.onClick = [this, i] { showPage (i); };
         surface.addAndMakeVisible (t);
 
@@ -2316,9 +2726,11 @@ MavkaAudioProcessorEditor::MavkaAudioProcessorEditor (MavkaAudioProcessor& p)
         const K ks[] =
         {
             { "lamp",      "Lamp",     "The lead: a warm asymmetric tube. Stays in tune and on time." },
-            { "glass",     "Glass",    "Doppler glass double: the voice moves its own speaker cone." },
-            { "fold",      "Fold",     "Folding diode double: metallic dirt." },
-            { "doppler",   "Doppler",  "Throw of the impossible speaker cone: more = glassier, singing harmonics." },
+            { "glass",     "Glass",    "Doppler glass double: the voice moves its own speaker cone. Fine controls "
+                                       "(time, repeats, float, tone, attack...): the DOUBLES tab." },
+            { "fold",      "Fold",     "Folding diode double: metallic dirt. Fine controls: the DOUBLES tab." },
+            { "doppler",   "Doppler",  "Throw of the impossible speaker cone: more = glassier, singing harmonics "
+                                       "(Glass Throw on the DOUBLES tab is the same knob)." },
             { "bias",      "Bias",     "Lamp asymmetry: even harmonics, warmth. Breathes with the clock." },
             { "ghostDown", "Ghost dn", "Octave below (with its natural fifth), fed into the machines." },
             { "ghostUp",   "Ghost up", "Octave above, fed into the machines." },
@@ -2438,6 +2850,86 @@ MavkaAudioProcessorEditor::MavkaAudioProcessorEditor (MavkaAudioProcessor& p)
         for (int i = 0; i < 6; ++i)
             addKnob (pg, ks[i].id, ks[i].t, false, { 563 + (i % 3) * 64, (i / 3) * 102, 64, 100 }, ks[i].tip);
     }
+    {
+        // DOUBLES: Glass and Fold, as finely as a delay. Every default is the sound of the earlier versions.
+        auto& pg = pages[6];
+        pg.description = "Glass and Fold - the doubles behind MAVKA's delay-like shadow - as fine as a delay: time (free or on "
+                         "the beat), repeats, float, tone, drive, and how they open on a word. Defaults = the sound of earlier versions.";
+        auto row = [&] (bool glass, int y)
+        {
+            const juce::String base = glass ? "glass" : "fold";
+            const juce::String who = glass ? "the glass double" : "the fold double";
+            pg.labels.push_back ({ glass ? "GLASS" : "FOLD", glass ? "doppler" : "diode", { 0, y, 44, 80 }, false });
+            int x = 44;
+            auto knob = [&] (const juce::String& id, const juce::String& title, const juce::String& tip)
+            {
+                addKnob (pg, id, title, false, { x, y, 64, 80 }, tip);
+                x += 64;
+            };
+            knob (base, "Level", "How loud " + who + " is (the same knob as " + juce::String (glass ? "Glass" : "Fold")
+                              + " on the HARDWARE tab).");
+            knob (base + "Time", "Time", "How far " + who + " sits behind your voice, in ms (double-click the number to type it). "
+                                      + juce::String (glass ? "23 ms" : "37 ms") + " = the sound of earlier versions. The right "
+                                      "channel keeps its offset from Width (CLOCK tab).");
+            addChoice (pg, base + "Sync", "Sync", { x + 2, y + 19, 60, 44 },
+                       "Free: the Time knob. Or lock " + who + " to the song: 1/64 to 1/8 (T = triplet) at the project tempo "
+                       "(300 ms at most).");
+            x += 64;
+            knob (base + "Repeats", "Repeats", "Feedback: " + who + " repeats like a delay, every repeat at the same time and "
+                                            "through the same Tone. 0% = one double, as before.");
+            knob (glass ? juce::String ("doppler") : juce::String ("foldThrow"), "Throw",
+                  glass ? juce::String ("How far your voice throws its own speaker cone: the glassy, singing pitch smear "
+                                        "(the same knob as Doppler on the HARDWARE tab).")
+                        : juce::String ("Doppler for the fold double too: your voice throws it like the glass one. 0% = as before."));
+            knob (base + "Float", "Float", "A slow pitch float of " + who + ", in cents - like a tape double drifting - at the Rate "
+                                       "next to it. The right channel floats a quarter turn behind the left. 0 = as before.");
+            knob (base + "Rate", "Rate", "How fast " + who + " floats (0.05 - 10 Hz).");
+            knob (base + "Tone", "Tone", "Dark: " + who + " (and every repeat) loses its top. Bright: it loses its body. "
+                                      "Neutral = as before.");
+            knob (base + "Drive", "Drive", "How hard the machine of " + who + " is driven, on top of Drive and Grit.");
+            knob (base + "Attack", "Attack", "How " + who + " meets a new word. Skip: it lets the first transient pass and opens "
+                                          "after it - the attack stays clean and the double blooms behind it. Grab: it hits the "
+                                          "attack harder and sits back on the sustain. Natural = as before.");
+            knob (base + "Open", "Open", "How softly " + who + " opens (Skip) or settles (Grab) after the attack, in ms.");
+        };
+        row (true, 38);
+        row (false, 122);
+    }
+    {
+        // IMAGER: the width of the wet sound in four bands
+        auto& pg = pages[7];
+        imagerField.setBounds (0, 0, 376, 204);
+        imagerField.setTooltip ("The width of MAVKA's sound across the spectrum: low at the bottom, high at the top, the stereo "
+                                "field left to right. Every ink stroke is a slice of frequencies - its length is how wide it is, "
+                                "its darkness how loud, the tick is where it sits. Blood: what the imager widened; a hairline: "
+                                "where it reached before. Drag a dashed split up / down; drag inside a band left / right to "
+                                "narrow or widen it (Alt: its Spread, Shift: fine); double-click to reset. The mono sum never changes.");
+        pg.addAndMakeVisible (imagerField);
+        pg.labels.push_back ({ "WIDTH", {}, { 380, 2, 12, 100 }, true });
+        pg.labels.push_back ({ "SPREAD", {}, { 380, 104, 12, 100 }, true });
+        pg.dividerX = 394 + 4 * 60 - 1;
+        pg.dividerTop = 8;
+        const char* bandNames[4] = { "Low", "Low mid", "High mid", "High" };
+        const char* bandLong[4] = { "low", "low-mid", "high-mid", "high" };
+        for (int b = 0; b < 4; ++b)
+        {
+            addKnob (pg, "imgW" + juce::String (b + 1), bandNames[b], false, { 394 + b * 60, 2, 60, 100 },
+                     "Width of MAVKA's sound in the " + juce::String (bandLong[b]) + " band: -100% = mono, 0% = as it is, "
+                     "+100% = twice as wide. Only the side changes - the mono sum stays exactly the same.");
+            addKnob (pg, "imgS" + juce::String (b + 1), bandNames[b], false, { 394 + b * 60, 104, 60, 100 },
+                     "Spread for the " + juce::String (bandLong[b]) + " band: a dispersed copy of its middle goes out to the "
+                     "sides - width for what has none. Mono-safe: the mono sum stays exactly the same.");
+        }
+        addKnob (pg, "imgX1", "Split 1", false, { 634, 2, 60, 100 },
+                 "Where the low and the low-mid band meet (Linkwitz-Riley, 24 dB / octave). Drag the dashed line in the picture too.");
+        addKnob (pg, "imgX2", "Split 2", false, { 694, 2, 60, 100 },
+                 "Where the low-mid and the high-mid band meet. Drag the dashed line in the picture too.");
+        addKnob (pg, "imgX3", "Split 3", false, { 634, 104, 60, 100 },
+                 "Where the high-mid and the high band meet. Drag the dashed line in the picture too.");
+        addKnob (pg, "imgRecover", "Recover", false, { 694, 104, 60, 100 },
+                 "When you narrow a band, what leaves its sides comes back in the middle (dispersed, so it adds body instead of "
+                 "combing) - the double keeps its weight in mono. Acts only on narrowed bands.");
+    }
 
     // ---- AURA: nonlinear send effects
     reverbSafe.setTooltip ("Reverb safe: for when MAVKA's sound goes ON INTO a reverb (MAVKA last on the vocal insert with "
@@ -2530,6 +3022,7 @@ MavkaAudioProcessorEditor::~MavkaAudioProcessorEditor()
 {
     stopTimer();
     proc.engine.setMetering (false);
+    proc.engine.setImagerMetering (false);
     texCancel = true;
     if (texJob.joinable())
         texJob.join();
@@ -2641,6 +3134,7 @@ void MavkaAudioProcessorEditor::showPage (int index)
         pages[(size_t) i].setVisible (i == index);
     currentPage = index;
     proc.engine.setMetering (index == 5);   // the overtone map and the scope cost a little: only while they are seen
+    proc.engine.setImagerMetering (index == 7);
 }
 
 void MavkaAudioProcessorEditor::paint (juce::Graphics& g)
@@ -2706,6 +3200,17 @@ void MavkaAudioProcessorEditor::timerCallback()
         overtoneMap.a4 = mavka::detuneToA4 (proc.apvts.getRawParameterValue ("detune")->load());
         overtoneMap.setView (ov, juce::String (mavka::kKeyChoices[key]) + " " + juce::String (mavka::kChordChoices[chord]).toLowerCase(),
                              polish);
+    }
+
+    if (currentPage == 7)
+    {
+        const int n = mavka::Engine::kImg;
+        for (auto& b : imgBuf)
+            b.resize ((size_t) n);
+        e.copyImager (imgBuf[0].data(), imgBuf[1].data(), imgBuf[2].data(), imgBuf[3].data());
+        imagerField.setData (imgBuf[0].data(), imgBuf[1].data(), imgBuf[2].data(), imgBuf[3].data(), n,
+                             proc.getSampleRate() > 0.0 ? proc.getSampleRate() : 48000.0, e.isImagerActive(),
+                             proc.getTotalNumOutputChannels() > 1);
     }
 
     updateTextures (false);

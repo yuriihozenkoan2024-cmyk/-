@@ -57,6 +57,8 @@ jobs:
           "$T" melodic
           "$T" reverbsafe
           "$T" tuning
+          "$T" doubles
+          "$T" imager
 
       - name: Collect plugin files
         shell: bash
